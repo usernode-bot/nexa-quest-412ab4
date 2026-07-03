@@ -9,6 +9,11 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const JWT_SECRET = process.env.JWT_SECRET;
 const IS_STAGING = process.env.USERNODE_ENV === 'staging';
 
+// NexaQuest MVP uses $TOKEN placeholder from Usernode (usernodeslabs).
+// Real token integration and social media APIs (Twitter, Discord, etc.) are
+// planned for Phase 2. All reward redemptions in MVP use this token placeholder.
+const REWARD_TOKEN_PLACEHOLDER = '$TOKEN';
+
 // Paths that stay open without authentication. Add a path here (and add it
 // with `app.get`/`app.post` below) if you deliberately want it public.
 // Everything else requires a valid platform-issued JWT.
@@ -643,8 +648,8 @@ async function seedStaging() {
      ON CONFLICT (id) DO NOTHING`,
 
     `INSERT INTO quests (id, campaign_id, title, description, category, verification_type, xp_reward, chain, est_minutes, status, ends_at) VALUES
-       (900001, 900001, 'Staging demo quest #1: Follow NexaQuest on X', 'Follow the official account and stay in the loop.', 'social', 'offchain', 30, NULL, 2, 'active', NOW() + INTERVAL '30 days'),
-       (900002, 900001, 'Staging demo quest #2: Join the Discord server', 'Say hi in #introductions once you are in.', 'social', 'offchain', 40, NULL, 3, 'active', NOW() + INTERVAL '30 days'),
+       (900001, 900001, '[Dikunci] Staging demo quest #1: Follow NexaQuest on X', 'Follow the official account and stay in the loop. — Dikunci: akan tersedia di fase mendatang', 'social', 'offchain', 30, NULL, 2, 'active', NOW() + INTERVAL '30 days'),
+       (900002, 900001, '[Dikunci] Staging demo quest #2: Join the Discord server', 'Say hi in #introductions once you are in. — Dikunci: akan tersedia di fase mendatang', 'social', 'offchain', 40, NULL, 3, 'active', NOW() + INTERVAL '30 days'),
        (900003, NULL,   'Staging demo quest #3: Complete the Web3 basics quiz', 'Five quick questions — no wrong-answer penalty.', 'learn', 'offchain', 50, NULL, 5, 'active', NOW() + INTERVAL '60 days'),
        (900004, 900002, 'Staging demo quest #4: Swap 5 USDC on Base', 'Make one small swap on any Base DEX.', 'defi', 'onchain', 120, 'base', 10, 'active', NOW() + INTERVAL '20 days'),
        (900005, 900002, 'Staging demo quest #5: Mint the starter NFT on Base', 'Mint the free starter collectible (gas only).', 'nft', 'onchain', 150, 'base', 8, 'active', NOW() + INTERVAL '20 days'),

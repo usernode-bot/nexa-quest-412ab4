@@ -202,6 +202,8 @@
       'stub.community': 'Ikuti campaign favoritmu untuk mulai melihat pembaruan di sini.',
       'stub.notifications': 'Belum ada notifikasi baru — semua sudah beres.',
       'stub.help': 'FAQ dan panduan keamanan segera hadir. Ingat: jangan pernah bagikan seed phrase.',
+      'locked.badge': 'Dikunci', 'locked.coming_soon': 'Akan tersedia di fase mendatang',
+      'about.token': 'Reward Token Placeholder', 'about.token_note': 'Saat ini, NexaQuest MVP menggunakan token placeholder <strong>$TOKEN</strong> dari usernodeslabs. Integrasi token asli dan API media sosial (Twitter, Discord, dll) direncanakan untuk Fase 2 pengembangan.',
     },
     en: {
       'tagline': 'Web3, without the hassle.',
@@ -261,6 +263,8 @@
       'stub.community': 'Follow your favorite campaigns to see updates here.',
       'stub.notifications': "No new notifications — you're all caught up.",
       'stub.help': 'FAQ and safety guides are coming soon. Remember: never share your seed phrase.',
+      'locked.badge': 'Locked', 'locked.coming_soon': 'Coming in a future update',
+      'about.token': 'Reward Token Placeholder', 'about.token_note': 'Currently, NexaQuest MVP uses the <strong>$TOKEN</strong> placeholder token from usernodeslabs. Native token integration and social media API support (Twitter, Discord, etc.) are planned for Phase 2.',
     },
   };
 
@@ -618,11 +622,18 @@
       list = card('<div class="p-8 text-center text-sm text-zinc-500 dark:text-zinc-400">' + esc(t('explore.empty')) + '</div>');
     } else {
       list = '<div class="grid gap-3 sm:grid-cols-2">' + quests.map(function (q) {
+        var isLocked = q.title && q.title.indexOf('[Dikunci]') === 0;
         var typeBadge = q.verification_type === 'onchain'
           ? '<span class="px-2 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-300 text-[11px] font-medium">on-chain' + (q.chain ? ' · ' + esc(q.chain) : '') + '</span>'
           : '<span class="px-2 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 text-[11px] font-medium">off-chain</span>';
-        return card('<div class="quest-card p-4 flex flex-col gap-3 h-full">' +
-          '<div class="flex items-start justify-between gap-2">' + typeBadge +
+        var lockBadge = isLocked
+          ? '<span class="px-2 py-0.5 rounded-md bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-300 text-[11px] font-medium">' + esc(t('locked.badge')) + '</span>'
+          : '';
+        var actionBtn = isLocked
+          ? '<span class="inline-flex px-3.5 py-1.5 rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-400 dark:text-zinc-500 text-sm font-medium cursor-not-allowed" title="' + esc(t('locked.coming_soon')) + '">' + esc(t('common.soon')) + '</span>'
+          : questActionButton(q);
+        return card('<div class="quest-card p-4 flex flex-col gap-3 h-full' + (isLocked ? ' opacity-75' : '') + '">' +
+          '<div class="flex items-start justify-between gap-2 flex-wrap">' + (lockBadge || typeBadge) +
           '<span class="text-sm font-semibold text-indigo-600 dark:text-indigo-400">+' + q.xp_reward + ' XP</span></div>' +
           '<div class="flex-1"><div class="font-medium text-sm leading-snug">' + esc(q.title) + '</div>' +
           (q.description ? '<p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1 leading-relaxed">' + esc(q.description) + '</p>' : '') +
@@ -630,7 +641,7 @@
           '<div class="flex items-center justify-between gap-2 pt-1">' +
           '<span class="text-xs text-zinc-400 dark:text-zinc-500">' + esc(t('explore.participants', { n: q.participants })) +
           (q.est_minutes ? ' · ' + esc(t('explore.min', { n: q.est_minutes })) : '') + '</span>' +
-          questActionButton(q) + '</div></div>', 'h-full');
+          actionBtn + '</div></div>', 'h-full');
       }).join('') + '</div>';
     }
 
@@ -825,6 +836,9 @@
           '<div class="flex justify-between gap-4"><span class="text-zinc-500 dark:text-zinc-400">' + esc(t('dash.level')) + '</span><span class="font-medium">' + (p ? p.level : '—') + ' · ' + (p ? p.total_xp : 0) + ' XP</span></div>' +
           '</div></div>') +
 
+        card('<div class="p-5"><div class="font-medium text-sm mb-3">' + esc(t('about.token')) + '</div>' +
+          '<p class="text-xs text-zinc-600 dark:text-zinc-300 leading-relaxed">' + t('about.token_note') + '</p></div>') +
+
         card('<div class="py-1"><div class="px-4 pt-3 pb-1 text-xs font-medium uppercase tracking-wider text-zinc-400 dark:text-zinc-500">' + esc(t('settings.more')) + '</div>' +
           '<div class="divide-y divide-zinc-100 dark:divide-zinc-800">' + moreLinks + '</div></div>') +
 
@@ -836,19 +850,23 @@
 
   // ---- Stub pages (follow-up slices) ----
   var STUBS = {
-    campaigns: { icon: 'megaphone', cta: false },
-    rewards: { icon: 'gift', cta: true },
-    badges: { icon: 'badge', cta: true },
-    referral: { icon: 'link', cta: false },
-    wallet: { icon: 'wallet', cta: false },
-    community: { icon: 'users', cta: false },
-    notifications: { icon: 'bell', cta: false },
-    help: { icon: 'help', cta: false },
+    campaigns: { icon: 'megaphone', cta: false, locked: false },
+    rewards: { icon: 'gift', cta: true, locked: false },
+    badges: { icon: 'badge', cta: true, locked: false },
+    referral: { icon: 'link', cta: false, locked: false },
+    wallet: { icon: 'wallet', cta: false, locked: false },
+    community: { icon: 'users', cta: false, locked: false },
+    notifications: { icon: 'bell', cta: false, locked: false },
+    help: { icon: 'help', cta: false, locked: false },
   };
   function renderStub(key) {
     var cfg = STUBS[key];
+    var lockBadge = cfg.locked
+      ? '<div class="mb-3"><span class="px-3 py-1 rounded-lg bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs font-medium">' + esc(t('locked.badge')) + ' — ' + esc(t('locked.coming_soon')) + '</span></div>'
+      : '';
     page().innerHTML = '<div class="fade-in">' + pageHeader(t('nav.' + key)) +
       card('<div class="p-10 md:p-14 text-center">' +
+        lockBadge +
         '<div class="mx-auto w-14 h-14 rounded-2xl bg-indigo-50 dark:bg-indigo-500/10 text-indigo-500 flex items-center justify-center mb-4">' + icon(cfg.icon, 'w-7 h-7') + '</div>' +
         '<p class="text-sm text-zinc-600 dark:text-zinc-300 mb-1">' + esc(t('stub.' + key)) + '</p>' +
         '<p class="text-xs text-zinc-400 dark:text-zinc-500 mb-5">' + esc(t('common.soon')) + '</p>' +
