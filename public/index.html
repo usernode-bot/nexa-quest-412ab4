@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="id" class="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  
+
   <script>
   // usernode-dev-console@1
   (function () {
@@ -63,59 +63,828 @@
     try { post('info', ['[dev-console ready]'], { kind: 'ready' }); } catch (_) {}
   })();
   </script>
-  <title>NEXA QUEST</title>
+  <title>NexaQuest</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>tailwind.config = { darkMode: 'class' }</script>
+  <style>
+    .fade-in { animation: fadeIn .25s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    .pop { animation: pop .3s ease-out; }
+    @keyframes pop { 0% { transform: scale(.92); } 60% { transform: scale(1.04); } 100% { transform: scale(1); } }
+  </style>
 </head>
-<body class="bg-zinc-950 text-zinc-100 min-h-screen flex flex-col items-center justify-center gap-8 p-4">
-  <h1 class="text-2xl font-bold">NEXA QUEST</h1>
+<body class="bg-zinc-100 dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 min-h-screen antialiased">
 
-  <button id="press-btn" class="w-32 h-32 rounded-full bg-violet-600 hover:bg-violet-500 active:scale-95 transition-all text-white text-xl font-bold shadow-lg shadow-violet-600/30">
-    Press!
-  </button>
+  <div id="app" class="flex min-h-screen">
+    <!-- Desktop sidebar -->
+    <aside class="hidden md:flex md:flex-col w-60 shrink-0 border-r border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/60 sticky top-0 h-screen overflow-y-auto">
+      <div class="px-5 pt-6 pb-4">
+        <div class="flex items-center gap-2">
+          <div class="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-bold text-sm">N</div>
+          <div>
+            <div class="font-semibold tracking-tight">NexaQuest</div>
+            <div id="side-tagline" class="text-[11px] text-zinc-500 dark:text-zinc-400"></div>
+          </div>
+        </div>
+      </div>
+      <nav id="sidenav" class="flex-1 px-3 pb-6 space-y-4"></nav>
+    </aside>
 
-  <div id="count" class="text-lg text-zinc-400">0 total presses</div>
+    <!-- Main column -->
+    <div class="flex-1 min-w-0 flex flex-col">
+      <!-- Mobile header -->
+      <header class="md:hidden sticky top-0 z-20 flex items-center justify-between px-4 h-14 border-b border-zinc-200 dark:border-zinc-800 bg-white/90 dark:bg-zinc-950/90 backdrop-blur">
+        <div class="flex items-center gap-2">
+          <div class="w-7 h-7 rounded-lg bg-indigo-600 flex items-center justify-center text-white font-bold text-xs">N</div>
+          <span class="font-semibold tracking-tight">NexaQuest</span>
+        </div>
+        <button data-nav="notifications" class="nav-extra p-2 rounded-lg text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800" aria-label="Notifications">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>
+        </button>
+      </header>
 
-  <div class="w-full max-w-sm">
-    <h2 class="text-sm font-medium text-zinc-500 mb-2 text-center">Leaderboard</h2>
-    <div id="leaderboard" class="space-y-1"></div>
+      <main class="flex-1 pb-24 md:pb-10">
+        <div id="page" class="max-w-5xl mx-auto px-4 md:px-8 py-6"></div>
+      </main>
+    </div>
   </div>
 
-  <script>
-    const params = new URLSearchParams(window.location.search);
-    const token = params.get('token') || '';
-    const headers = token ? { 'x-usernode-token': token } : {};
+  <!-- Mobile bottom nav -->
+  <nav id="bottomnav" class="md:hidden fixed bottom-0 inset-x-0 z-20 grid grid-cols-5 border-t border-zinc-200 dark:border-zinc-800 bg-white/95 dark:bg-zinc-950/95 backdrop-blur"></nav>
 
-    async function loadLeaderboard() {
-      const res = await fetch('/api/leaderboard', { headers });
-      if (!res.ok) return;
-      const { leaderboard } = await res.json();
-      const el = document.getElementById('leaderboard');
-      if (!leaderboard.length) {
-        el.innerHTML = '<p class="text-center text-zinc-600 text-sm">No presses yet</p>';
-        return;
+  <!-- Toast -->
+  <div id="toast" class="fixed bottom-24 md:bottom-8 left-1/2 -translate-x-1/2 z-50 hidden">
+    <div id="toast-body" class="pop px-4 py-2.5 rounded-xl bg-zinc-900 dark:bg-zinc-100 text-zinc-100 dark:text-zinc-900 text-sm font-medium shadow-lg max-w-[90vw]"></div>
+  </div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ------------------------------------------------------------------
+  // Auth token (injected by the platform shell as ?token=…)
+  // ------------------------------------------------------------------
+  var TOKEN = new URLSearchParams(location.search).get('token') || '';
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign(
+      { 'x-usernode-token': TOKEN },
+      opts.body ? { 'Content-Type': 'application/json' } : {},
+      opts.headers || {}
+    );
+    return fetch(path, opts).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok) { var e = new Error(data.error || ('HTTP ' + res.status)); e.status = res.status; e.data = data; throw e; }
+        return data;
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // i18n — static ID/EN dictionaries, default Bahasa Indonesia (spec §12a)
+  // ------------------------------------------------------------------
+  var I18N = {
+    id: {
+      'tagline': 'Web3, tanpa ribetnya.',
+      'nav.dashboard': 'Beranda', 'nav.explore': 'Jelajah Quest', 'nav.campaigns': 'Campaign',
+      'nav.checkin': 'Check-in', 'nav.rewards': 'Reward', 'nav.leaderboard': 'Peringkat',
+      'nav.wallet': 'Profil Wallet', 'nav.badges': 'Badge Saya', 'nav.referral': 'Referral',
+      'nav.community': 'Komunitas', 'nav.notifications': 'Notifikasi', 'nav.help': 'Bantuan',
+      'nav.settings': 'Pengaturan',
+      'nav.group.main': 'Utama', 'nav.group.me': 'Profil Saya', 'nav.group.more': 'Lainnya',
+      'common.error': 'Gagal memuat data terbaru.', 'common.retry': 'Coba lagi',
+      'common.soon': 'Fitur ini segera hadir di pembaruan berikutnya.',
+      'common.explore_cta': 'Jelajahi Quest',
+      'dash.hello': 'Halo', 'dash.level': 'Level', 'dash.streak': 'Streak',
+      'dash.days': 'hari', 'dash.xp_total': 'Total XP', 'dash.quests_done': 'Quest selesai',
+      'dash.to_next': '{n} XP lagi menuju Level {l}',
+      'dash.checkin_cta': 'Check-in Hari Ini', 'dash.checkin_done': 'Sudah check-in hari ini ✓',
+      'dash.recommended': 'Quest Direkomendasikan', 'dash.activity': 'Aktivitas Terbaru',
+      'dash.view_all': 'Lihat semua',
+      'dash.empty': 'Belum ada yang dimulai di sini. Yuk, jelajahi quest pertamamu.',
+      'dash.empty_cta': 'Mulai Quest Pertama',
+      'dash.empty_activity': 'Aktivitasmu akan muncul di sini.',
+      'activity.quest': 'Quest selesai', 'activity.checkin': 'Check-in harian',
+      'explore.title': 'Jelajah Quest', 'explore.subtitle': 'Selesaikan quest, kumpulkan XP, naikkan level.',
+      'explore.all': 'Semua', 'explore.offchain': 'Off-chain', 'explore.onchain': 'On-chain',
+      'explore.participants': '{n} peserta', 'explore.min': '± {n} menit',
+      'explore.start': 'Mulai Quest', 'explore.verify': 'Verifikasi Tugas',
+      'explore.done': 'Selesai ✓', 'explore.pending': 'Menunggu verifikasi on-chain',
+      'explore.empty': 'Tidak ada quest yang cocok, coba ubah filter.',
+      'explore.verified_toast': 'Selesai! +{n} XP masuk ke akunmu.',
+      'explore.pending_toast': 'Verifikasi on-chain sedang berjalan — cek lagi dalam beberapa menit.',
+      'checkin.title': 'Check-in Harian',
+      'checkin.subtitle': 'Jaga streak-mu — bonus milestone di hari ke-7, 14, dan 30.',
+      'checkin.button': 'Check-in Hari Ini', 'checkin.done': 'Kamu sudah check-in hari ini ✓',
+      'checkin.streak': 'Streak saat ini', 'checkin.longest': 'Streak terpanjang',
+      'checkin.last30': '30 hari terakhir',
+      'checkin.success': 'Check-in berhasil! +{n} XP.',
+      'checkin.milestone': 'Milestone hari ke-{d}! Bonus XP masuk.',
+      'checkin.note': 'Streak putus tidak menghapus XP-mu — hanya progres milestone yang direset.',
+      'lb.title': 'Peringkat', 'lb.subtitle': 'Bersaing sehat setiap minggu — papan direset berkala.',
+      'lb.weekly': 'Mingguan', 'lb.monthly': 'Bulanan', 'lb.alltime': 'Sepanjang Waktu',
+      'lb.you': 'Kamu', 'lb.your_rank': 'Peringkat kamu', 'lb.points': 'XP',
+      'lb.empty': 'Jadilah yang pertama masuk peringkat minggu ini.',
+      'lb.unranked': 'Belum masuk peringkat — selesaikan quest untuk mulai.',
+      'settings.title': 'Pengaturan',
+      'settings.language': 'Bahasa', 'settings.language_note': 'Berlaku langsung di seluruh aplikasi dan tersimpan di akunmu.',
+      'settings.theme': 'Tema', 'settings.dark': 'Gelap', 'settings.light': 'Terang',
+      'settings.account': 'Akun', 'settings.wallet_identity': 'Identitas wallet',
+      'settings.not_linked': 'Belum terhubung',
+      'settings.more': 'Menu lainnya',
+      'settings.saved': 'Preferensi bahasa tersimpan.',
+      'settings.save_retry': 'Gagal menyimpan ke server — dicoba ulang di latar belakang.',
+      'stub.campaigns': 'Belum ada campaign aktif minggu ini — cek lagi besok.',
+      'stub.rewards': 'Marketplace reward segera dibuka. Kumpulkan XP dulu lewat quest.',
+      'stub.badges': 'Belum ada badge — selesaikan quest pertamamu untuk membuka yang pertama.',
+      'stub.referral': 'Belum ada undangan — pusat referral segera hadir.',
+      'stub.wallet': 'Profil wallet dan skor reputasi segera hadir.',
+      'stub.community': 'Ikuti campaign favoritmu untuk mulai melihat pembaruan di sini.',
+      'stub.notifications': 'Belum ada notifikasi baru — semua sudah beres.',
+      'stub.help': 'FAQ dan panduan keamanan segera hadir. Ingat: jangan pernah bagikan seed phrase.',
+    },
+    en: {
+      'tagline': 'Web3, without the hassle.',
+      'nav.dashboard': 'Home', 'nav.explore': 'Explore Quests', 'nav.campaigns': 'Campaigns',
+      'nav.checkin': 'Check-in', 'nav.rewards': 'Rewards', 'nav.leaderboard': 'Leaderboard',
+      'nav.wallet': 'Wallet Profile', 'nav.badges': 'My Badges', 'nav.referral': 'Referral',
+      'nav.community': 'Community', 'nav.notifications': 'Notifications', 'nav.help': 'Help Center',
+      'nav.settings': 'Settings',
+      'nav.group.main': 'Main', 'nav.group.me': 'My Profile', 'nav.group.more': 'More',
+      'common.error': "Couldn't load the latest data.", 'common.retry': 'Try again',
+      'common.soon': 'This feature is coming in an upcoming update.',
+      'common.explore_cta': 'Explore Quests',
+      'dash.hello': 'Hi', 'dash.level': 'Level', 'dash.streak': 'Streak',
+      'dash.days': 'days', 'dash.xp_total': 'Total XP', 'dash.quests_done': 'Quests done',
+      'dash.to_next': '{n} XP to Level {l}',
+      'dash.checkin_cta': 'Check In Today', 'dash.checkin_done': 'Checked in today ✓',
+      'dash.recommended': 'Recommended Quests', 'dash.activity': 'Recent Activity',
+      'dash.view_all': 'View all',
+      'dash.empty': 'Nothing here yet. Go explore your first quest.',
+      'dash.empty_cta': 'Start Your First Quest',
+      'dash.empty_activity': 'Your activity will show up here.',
+      'activity.quest': 'Quest completed', 'activity.checkin': 'Daily check-in',
+      'explore.title': 'Explore Quests', 'explore.subtitle': 'Complete quests, earn XP, level up.',
+      'explore.all': 'All', 'explore.offchain': 'Off-chain', 'explore.onchain': 'On-chain',
+      'explore.participants': '{n} participants', 'explore.min': '± {n} min',
+      'explore.start': 'Start Quest', 'explore.verify': 'Verify Task',
+      'explore.done': 'Done ✓', 'explore.pending': 'Awaiting on-chain verification',
+      'explore.empty': 'No quests match — try a different filter.',
+      'explore.verified_toast': 'Done! +{n} XP added to your account.',
+      'explore.pending_toast': 'On-chain verification in progress — check back in a few minutes.',
+      'checkin.title': 'Daily Check-in',
+      'checkin.subtitle': 'Keep your streak alive — milestone bonuses on day 7, 14, and 30.',
+      'checkin.button': 'Check In Today', 'checkin.done': "You've checked in today ✓",
+      'checkin.streak': 'Current streak', 'checkin.longest': 'Longest streak',
+      'checkin.last30': 'Last 30 days',
+      'checkin.success': 'Checked in! +{n} XP.',
+      'checkin.milestone': 'Day {d} milestone! Bonus XP earned.',
+      'checkin.note': 'A broken streak never removes XP — only milestone progress resets.',
+      'lb.title': 'Leaderboard', 'lb.subtitle': 'Healthy competition — boards reset periodically.',
+      'lb.weekly': 'Weekly', 'lb.monthly': 'Monthly', 'lb.alltime': 'All-time',
+      'lb.you': 'You', 'lb.your_rank': 'Your rank', 'lb.points': 'XP',
+      'lb.empty': "Be the first on this week's board.",
+      'lb.unranked': 'Not ranked yet — complete a quest to get started.',
+      'settings.title': 'Settings',
+      'settings.language': 'Language', 'settings.language_note': 'Applies instantly across the app and is saved to your account.',
+      'settings.theme': 'Theme', 'settings.dark': 'Dark', 'settings.light': 'Light',
+      'settings.account': 'Account', 'settings.wallet_identity': 'Wallet identity',
+      'settings.not_linked': 'Not linked',
+      'settings.more': 'More',
+      'settings.saved': 'Language preference saved.',
+      'settings.save_retry': "Couldn't save to the server — retrying in the background.",
+      'stub.campaigns': 'No active campaigns this week — check back tomorrow.',
+      'stub.rewards': 'The rewards marketplace opens soon. Stack XP through quests meanwhile.',
+      'stub.badges': 'No badges yet — finish your first quest to unlock one.',
+      'stub.referral': 'No invites yet — the referral center is coming soon.',
+      'stub.wallet': 'Wallet profile and reputation score are coming soon.',
+      'stub.community': 'Follow your favorite campaigns to see updates here.',
+      'stub.notifications': "No new notifications — you're all caught up.",
+      'stub.help': 'FAQ and safety guides are coming soon. Remember: never share your seed phrase.',
+    },
+  };
+
+  var state = {
+    lang: (function () {
+      try { var v = localStorage.getItem('nexaquest_lang'); return (v === 'en' || v === 'id') ? v : 'id'; }
+      catch (_) { return 'id'; }
+    })(),
+    profile: null,
+    route: 'dashboard',
+  };
+
+  function t(key, params) {
+    var s = (I18N[state.lang] && I18N[state.lang][key]) || I18N.id[key] || key;
+    if (params) Object.keys(params).forEach(function (k) {
+      s = s.replace(new RegExp('\\{' + k + '\\}', 'g'), params[k]);
+    });
+    return s;
+  }
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  // ------------------------------------------------------------------
+  // Theme (dark default, light optional; local preference only)
+  // ------------------------------------------------------------------
+  function applyTheme(theme) {
+    document.documentElement.classList.toggle('dark', theme !== 'light');
+    try { localStorage.setItem('nexaquest_theme', theme); } catch (_) {}
+  }
+  try {
+    if (localStorage.getItem('nexaquest_theme') === 'light') applyTheme('light');
+  } catch (_) {}
+
+  // ------------------------------------------------------------------
+  // Toast
+  // ------------------------------------------------------------------
+  var toastTimer = null;
+  function toast(msg) {
+    var el = document.getElementById('toast');
+    document.getElementById('toast-body').textContent = msg;
+    el.classList.remove('hidden');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.classList.add('hidden'); }, 3200);
+  }
+
+  // ------------------------------------------------------------------
+  // Icons (inline line icons, stroke style per spec §9)
+  // ------------------------------------------------------------------
+  function icon(name, cls) {
+    var paths = {
+      home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/>',
+      compass: '<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/>',
+      calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18"/><path d="m9.5 15 2 2 3.5-3.5"/>',
+      trophy: '<path d="M8 21h8M12 17v4"/><path d="M7 4h10v6a5 5 0 0 1-10 0z"/><path d="M7 6H4a3 3 0 0 0 3 4M17 6h3a3 3 0 0 1-3 4"/>',
+      gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h.01a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55h.01a1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.01a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.55 1z"/>',
+      gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13M5 12v9h14v-9"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C11 3 12 8 12 8s1-5 4.5-5a2.5 2.5 0 0 1 0 5"/>',
+      wallet: '<path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/>',
+      badge: '<circle cx="12" cy="9" r="6"/><path d="m8.5 14-2 7 5.5-3 5.5 3-2-7"/>',
+      users: '<path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"/><circle cx="10" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
+      megaphone: '<path d="m3 11 18-7-4 14-6-3z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/>',
+      bell: '<path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
+      help: '<circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 2.5-3 4"/><path d="M12 17.5h.01"/>',
+      link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
+      flame: '<path d="M12 22c4.4 0 7-2.7 7-6.5 0-3-2-5-3.5-6.5C14 7.5 13 5.5 13 3c-3 2-4.5 4.5-4.5 7C7 9 6.5 8.2 6.3 7 5 8.8 5 10.7 5 12.5 5 19.3 7.6 22 12 22z"/>',
+      zap: '<path d="M13 2 3 14h7l-1 8 10-12h-7z"/>',
+    };
+    return '<svg class="' + (cls || 'w-5 h-5') + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + (paths[name] || '') + '</svg>';
+  }
+
+  // ------------------------------------------------------------------
+  // Navigation
+  // ------------------------------------------------------------------
+  var NAV = {
+    main: [
+      { key: 'dashboard', icon: 'home' },
+      { key: 'explore', icon: 'compass' },
+      { key: 'campaigns', icon: 'megaphone' },
+      { key: 'checkin', icon: 'calendar' },
+      { key: 'rewards', icon: 'gift' },
+      { key: 'leaderboard', icon: 'trophy' },
+    ],
+    me: [
+      { key: 'wallet', icon: 'wallet' },
+      { key: 'badges', icon: 'badge' },
+      { key: 'referral', icon: 'link' },
+    ],
+    more: [
+      { key: 'community', icon: 'users' },
+      { key: 'notifications', icon: 'bell' },
+      { key: 'help', icon: 'help' },
+      { key: 'settings', icon: 'gear' },
+    ],
+  };
+  var BOTTOM = ['dashboard', 'explore', 'checkin', 'leaderboard', 'settings'];
+  var VALID_ROUTES = ['dashboard', 'explore', 'campaigns', 'checkin', 'rewards', 'leaderboard',
+    'wallet', 'badges', 'referral', 'community', 'notifications', 'help', 'settings'];
+
+  function renderSidenav() {
+    var html = '';
+    [['main', NAV.main], ['me', NAV.me], ['more', NAV.more]].forEach(function (group) {
+      html += '<div><div class="px-3 pb-1.5 text-[11px] font-medium uppercase tracking-wider text-zinc-400 dark:text-zinc-500">' +
+        esc(t('nav.group.' + group[0])) + '</div><div class="space-y-0.5">';
+      group[1].forEach(function (item) {
+        var active = state.route === item.key;
+        html += '<button data-nav="' + item.key + '" class="nav-item w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors ' +
+          (active
+            ? 'bg-indigo-50 dark:bg-indigo-500/10 text-indigo-700 dark:text-indigo-300 font-medium'
+            : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800/70 hover:text-zinc-900 dark:hover:text-zinc-100') + '">' +
+          icon(item.icon, 'w-[18px] h-[18px] shrink-0') + '<span>' + esc(t('nav.' + item.key)) + '</span></button>';
+      });
+      html += '</div></div>';
+    });
+    document.getElementById('sidenav').innerHTML = html;
+    document.getElementById('side-tagline').textContent = t('tagline');
+  }
+
+  function renderBottomNav() {
+    var html = '';
+    BOTTOM.forEach(function (key) {
+      var item = NAV.main.concat(NAV.me, NAV.more).find(function (i) { return i.key === key; });
+      var active = state.route === key;
+      html += '<button data-nav="' + key + '" class="nav-item flex flex-col items-center justify-center gap-0.5 py-2.5 ' +
+        (active ? 'text-indigo-600 dark:text-indigo-400' : 'text-zinc-500 dark:text-zinc-500') + '">' +
+        icon(item.icon, 'w-5 h-5') +
+        '<span class="text-[10px] font-medium leading-none">' + esc(t('nav.' + key)) + '</span></button>';
+    });
+    document.getElementById('bottomnav').innerHTML = html;
+  }
+
+  function navigate(route, replace) {
+    if (VALID_ROUTES.indexOf(route) === -1) route = 'dashboard';
+    state.route = route;
+    var url = '/' + (route === 'dashboard' ? '' : route) + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : '');
+    try { history[replace ? 'replaceState' : 'pushState']({}, '', url); } catch (_) {}
+    renderAll();
+  }
+
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest('[data-nav]');
+    if (btn) navigate(btn.getAttribute('data-nav'));
+  });
+  window.addEventListener('popstate', function () {
+    state.route = routeFromPath();
+    renderAll();
+  });
+  function routeFromPath() {
+    var seg = location.pathname.replace(/^\/+|\/+$/g, '');
+    return VALID_ROUTES.indexOf(seg) !== -1 ? seg : 'dashboard';
+  }
+
+  // ------------------------------------------------------------------
+  // Shared UI bits
+  // ------------------------------------------------------------------
+  function skeleton(rows) {
+    var h = '<div class="space-y-4 fade-in">';
+    for (var i = 0; i < (rows || 3); i++) {
+      h += '<div class="animate-pulse rounded-2xl bg-zinc-200/70 dark:bg-zinc-800/70 h-24"></div>';
+    }
+    return h + '</div>';
+  }
+  function errorBanner(retryFnName) {
+    return '<div class="fade-in rounded-2xl border border-amber-300/50 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 px-4 py-3 flex items-center justify-between gap-3">' +
+      '<span class="text-sm text-amber-800 dark:text-amber-200">' + esc(t('common.error')) + '</span>' +
+      '<button onclick="' + retryFnName + '()" class="text-sm font-medium text-amber-900 dark:text-amber-100 underline underline-offset-2">' + esc(t('common.retry')) + '</button></div>';
+  }
+  function pageHeader(title, subtitle) {
+    return '<div class="mb-6"><h1 class="text-xl md:text-2xl font-semibold tracking-tight">' + esc(title) + '</h1>' +
+      (subtitle ? '<p class="text-sm text-zinc-500 dark:text-zinc-400 mt-1">' + esc(subtitle) + '</p>' : '') + '</div>';
+  }
+  function card(inner, extra) {
+    return '<div class="rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/60 shadow-sm ' + (extra || '') + '">' + inner + '</div>';
+  }
+
+  function fmtDate(iso) {
+    try {
+      return new Date(iso).toLocaleDateString(state.lang === 'id' ? 'id-ID' : 'en-US', { day: 'numeric', month: 'short' });
+    } catch (_) { return ''; }
+  }
+
+  // ------------------------------------------------------------------
+  // Data
+  // ------------------------------------------------------------------
+  function loadProfile() {
+    return api('/api/profile').then(function (data) {
+      state.profile = data;
+      // Server is source of truth for language; adopt it unless the user just
+      // switched locally and the save is still in flight.
+      var serverLang = data.profile.language;
+      if ((serverLang === 'id' || serverLang === 'en') && serverLang !== state.lang && !state.langDirty) {
+        state.lang = serverLang;
+        try { localStorage.setItem('nexaquest_lang', serverLang); } catch (_) {}
+        document.documentElement.lang = serverLang;
+        renderAll();
       }
-      el.innerHTML = leaderboard.map((r, i) =>
-        '<div class="flex justify-between px-3 py-1 rounded ' + (i === 0 ? 'bg-violet-600/20 text-violet-300' : 'text-zinc-400') + '">' +
-        '<span>' + (i + 1) + '. ' + r.username + '</span>' +
-        '<span class="font-mono">' + r.presses + '</span></div>'
-      ).join('');
-      const total = leaderboard.reduce((s, r) => s + parseInt(r.presses), 0);
-      document.getElementById('count').textContent = total + ' total presses';
+      return data;
+    });
+  }
+
+  function setLanguage(lang) {
+    if (lang !== 'id' && lang !== 'en') return;
+    state.lang = lang;
+    state.langDirty = true;
+    try { localStorage.setItem('nexaquest_lang', lang); } catch (_) {}
+    document.documentElement.lang = lang;
+    renderAll(); // apply instantly, no reload (spec §5 Settings)
+    var save = function () {
+      return api('/api/profile/language', { method: 'PATCH', body: JSON.stringify({ language: lang }) });
+    };
+    save().then(function () {
+      state.langDirty = false;
+      toast(t('settings.saved'));
+    }).catch(function () {
+      toast(t('settings.save_retry'));
+      setTimeout(function () {
+        save().then(function () { state.langDirty = false; }).catch(function () {});
+      }, 5000);
+    });
+  }
+  window.__setLanguage = setLanguage;
+  window.__setTheme = function (theme) { applyTheme(theme); renderAll(); };
+
+  // ------------------------------------------------------------------
+  // Pages
+  // ------------------------------------------------------------------
+  var page = function () { return document.getElementById('page'); };
+
+  // ---- Dashboard ----
+  function renderDashboard() {
+    page().innerHTML = skeleton(3);
+    Promise.all([loadProfile(), api('/api/quests')]).then(function (res) {
+      if (state.route !== 'dashboard') return;
+      var p = res[0].profile, stats = res[0].stats, activity = res[0].activity;
+      var quests = res[1].quests || [];
+      var pct = Math.min(100, Math.round(
+        ((p.total_xp - p.xp_level_start) / Math.max(1, p.xp_level_next - p.xp_level_start)) * 100));
+      var recommended = quests.filter(function (q) { return !q.my_status; }).slice(0, 3);
+
+      var hero = card(
+        '<div class="p-5 md:p-6">' +
+          '<div class="flex items-start justify-between gap-4 flex-wrap">' +
+            '<div>' +
+              '<div class="text-sm text-zinc-500 dark:text-zinc-400">' + esc(t('dash.hello')) + ', <span class="font-medium text-zinc-800 dark:text-zinc-200">' + esc(p.username) + '</span></div>' +
+              '<div class="mt-1 flex items-baseline gap-2">' +
+                '<span class="text-3xl font-semibold tracking-tight">' + esc(t('dash.level')) + ' ' + p.level + '</span>' +
+                '<span class="text-sm text-zinc-500 dark:text-zinc-400">' + p.total_xp + ' XP</span>' +
+              '</div>' +
+            '</div>' +
+            '<div class="flex items-center gap-2 px-3 py-2 rounded-xl bg-orange-50 dark:bg-orange-500/10 text-orange-600 dark:text-orange-400">' +
+              icon('flame', 'w-5 h-5') +
+              '<span class="font-semibold">' + p.current_streak + '</span>' +
+              '<span class="text-sm">' + esc(t('dash.days')) + '</span>' +
+            '</div>' +
+          '</div>' +
+          '<div class="mt-4">' +
+            '<div class="h-2 rounded-full bg-zinc-200 dark:bg-zinc-800 overflow-hidden">' +
+              '<div class="h-full rounded-full bg-indigo-500 transition-all" style="width:' + pct + '%"></div>' +
+            '</div>' +
+            '<div class="mt-1.5 text-xs text-zinc-500 dark:text-zinc-400">' +
+              esc(t('dash.to_next', { n: Math.max(0, p.xp_level_next - p.total_xp), l: p.level + 1 })) + '</div>' +
+          '</div>' +
+          '<div class="mt-5 flex items-center gap-3 flex-wrap">' +
+            (p.checked_in_today
+              ? '<span class="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-sm font-medium">' + esc(t('dash.checkin_done')) + '</span>'
+              : '<button data-nav="checkin" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">' + esc(t('dash.checkin_cta')) + '</button>') +
+            '<div class="text-sm text-zinc-500 dark:text-zinc-400">' + stats.quests_completed + ' ' + esc(t('dash.quests_done').toLowerCase()) + ' · ' + stats.badges + ' badge</div>' +
+          '</div>' +
+        '</div>'
+      );
+
+      var recHtml;
+      if (recommended.length === 0 && stats.quests_completed === 0) {
+        recHtml = card('<div class="p-8 text-center">' +
+          '<div class="mx-auto w-12 h-12 rounded-2xl bg-indigo-50 dark:bg-indigo-500/10 text-indigo-500 flex items-center justify-center mb-3">' + icon('compass', 'w-6 h-6') + '</div>' +
+          '<p class="text-sm text-zinc-500 dark:text-zinc-400 mb-4">' + esc(t('dash.empty')) + '</p>' +
+          '<button data-nav="explore" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium">' + esc(t('dash.empty_cta')) + '</button></div>');
+      } else {
+        recHtml = '<div class="space-y-3">' + recommended.map(function (q) {
+          return card('<button data-nav="explore" class="w-full text-left p-4 flex items-center gap-4">' +
+            '<div class="w-10 h-10 rounded-xl bg-indigo-50 dark:bg-indigo-500/10 text-indigo-500 flex items-center justify-center shrink-0">' + icon('zap', 'w-5 h-5') + '</div>' +
+            '<div class="min-w-0 flex-1"><div class="text-sm font-medium truncate">' + esc(q.title) + '</div>' +
+            '<div class="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">' + (q.campaign_title ? esc(q.campaign_title) + ' · ' : '') + esc(t('explore.participants', { n: q.participants })) + '</div></div>' +
+            '<span class="text-sm font-semibold text-indigo-600 dark:text-indigo-400 shrink-0">+' + q.xp_reward + ' XP</span></button>');
+        }).join('') + '</div>';
+        if (recommended.length === 0) recHtml = '<p class="text-sm text-zinc-500 dark:text-zinc-400">' + esc(t('explore.empty')) + '</p>';
+      }
+
+      var actHtml;
+      if (!activity || activity.length === 0) {
+        actHtml = card('<div class="p-6 text-center text-sm text-zinc-500 dark:text-zinc-400">' + esc(t('dash.empty_activity')) + '</div>');
+      } else {
+        actHtml = card('<div class="divide-y divide-zinc-100 dark:divide-zinc-800">' + activity.map(function (a) {
+          var label = a.reason === 'daily_checkin' ? t('activity.checkin') : t('activity.quest');
+          var detail = a.quest_title ? ' — ' + a.quest_title : '';
+          return '<div class="px-4 py-3 flex items-center justify-between gap-3">' +
+            '<div class="min-w-0"><div class="text-sm truncate">' + esc(label + detail) + '</div>' +
+            '<div class="text-xs text-zinc-400 dark:text-zinc-500">' + esc(fmtDate(a.created_at)) + '</div></div>' +
+            '<span class="text-sm font-semibold ' + (a.amount >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500') + ' shrink-0">' + (a.amount >= 0 ? '+' : '') + a.amount + ' XP</span></div>';
+        }).join('') + '</div>');
+      }
+
+      page().innerHTML = '<div class="fade-in space-y-6">' + hero +
+        '<div><div class="flex items-center justify-between mb-3"><h2 class="font-semibold">' + esc(t('dash.recommended')) + '</h2>' +
+        '<button data-nav="explore" class="text-sm text-indigo-600 dark:text-indigo-400 font-medium">' + esc(t('dash.view_all')) + '</button></div>' + recHtml + '</div>' +
+        '<div><h2 class="font-semibold mb-3">' + esc(t('dash.activity')) + '</h2>' + actHtml + '</div></div>';
+    }).catch(function () {
+      if (state.route === 'dashboard') page().innerHTML = errorBanner('__retryPage');
+    });
+  }
+
+  // ---- Explore ----
+  var exploreFilter = 'all';
+  function questActionButton(q) {
+    if (q.my_status === 'verified') {
+      return '<span class="inline-flex px-3.5 py-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-sm font-medium">' + esc(t('explore.done')) + '</span>';
+    }
+    if (q.my_status === 'pending') {
+      return '<span class="inline-flex px-3.5 py-1.5 rounded-lg bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs font-medium">' + esc(t('explore.pending')) + '</span>';
+    }
+    if (q.my_status === 'started') {
+      return '<button onclick="__verifyQuest(' + q.id + ')" class="px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium transition-colors">' + esc(t('explore.verify')) + '</button>';
+    }
+    return '<button onclick="__startQuest(' + q.id + ')" class="px-3.5 py-1.5 rounded-lg border border-indigo-300 dark:border-indigo-500/40 text-indigo-700 dark:text-indigo-300 hover:bg-indigo-50 dark:hover:bg-indigo-500/10 text-sm font-medium transition-colors">' + esc(t('explore.start')) + '</button>';
+  }
+
+  function renderExplore() {
+    page().innerHTML = pageHeader(t('explore.title'), t('explore.subtitle')) + skeleton(4);
+    api('/api/quests').then(function (data) {
+      if (state.route !== 'explore') return;
+      state.quests = data.quests || [];
+      drawExplore();
+    }).catch(function () {
+      if (state.route === 'explore') page().innerHTML = pageHeader(t('explore.title'), t('explore.subtitle')) + errorBanner('__retryPage');
+    });
+  }
+
+  function drawExplore() {
+    var quests = (state.quests || []).filter(function (q) {
+      if (exploreFilter === 'offchain') return q.verification_type === 'offchain';
+      if (exploreFilter === 'onchain') return q.verification_type === 'onchain';
+      return true;
+    });
+    var chips = [['all', t('explore.all')], ['offchain', t('explore.offchain')], ['onchain', t('explore.onchain')]]
+      .map(function (c) {
+        var active = exploreFilter === c[0];
+        return '<button onclick="__setExploreFilter(\'' + c[0] + '\')" class="px-3.5 py-1.5 rounded-full text-sm font-medium transition-colors ' +
+          (active ? 'bg-indigo-600 text-white' : 'bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-zinc-600 dark:text-zinc-400 hover:border-indigo-300 dark:hover:border-indigo-500/40') + '">' + esc(c[1]) + '</button>';
+      }).join('');
+
+    var list;
+    if (quests.length === 0) {
+      list = card('<div class="p-8 text-center text-sm text-zinc-500 dark:text-zinc-400">' + esc(t('explore.empty')) + '</div>');
+    } else {
+      list = '<div class="grid gap-3 sm:grid-cols-2">' + quests.map(function (q) {
+        var typeBadge = q.verification_type === 'onchain'
+          ? '<span class="px-2 py-0.5 rounded-md bg-indigo-50 dark:bg-indigo-500/10 text-indigo-600 dark:text-indigo-300 text-[11px] font-medium">on-chain' + (q.chain ? ' · ' + esc(q.chain) : '') + '</span>'
+          : '<span class="px-2 py-0.5 rounded-md bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400 text-[11px] font-medium">off-chain</span>';
+        return card('<div class="quest-card p-4 flex flex-col gap-3 h-full">' +
+          '<div class="flex items-start justify-between gap-2">' + typeBadge +
+          '<span class="text-sm font-semibold text-indigo-600 dark:text-indigo-400">+' + q.xp_reward + ' XP</span></div>' +
+          '<div class="flex-1"><div class="font-medium text-sm leading-snug">' + esc(q.title) + '</div>' +
+          (q.description ? '<p class="text-xs text-zinc-500 dark:text-zinc-400 mt-1 leading-relaxed">' + esc(q.description) + '</p>' : '') +
+          (q.campaign_title ? '<div class="text-[11px] text-zinc-400 dark:text-zinc-500 mt-1.5">' + esc(q.campaign_title) + '</div>' : '') + '</div>' +
+          '<div class="flex items-center justify-between gap-2 pt-1">' +
+          '<span class="text-xs text-zinc-400 dark:text-zinc-500">' + esc(t('explore.participants', { n: q.participants })) +
+          (q.est_minutes ? ' · ' + esc(t('explore.min', { n: q.est_minutes })) : '') + '</span>' +
+          questActionButton(q) + '</div></div>', 'h-full');
+      }).join('') + '</div>';
     }
 
-    document.getElementById('press-btn').addEventListener('click', async () => {
-      try {
-        const res = await fetch('/api/press', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...headers },
-        });
-        if (res.ok) loadLeaderboard();
-        else if (res.status === 401) document.getElementById('count').textContent = 'Sign in to press!';
-      } catch {}
-    });
+    page().innerHTML = '<div class="fade-in">' + pageHeader(t('explore.title'), t('explore.subtitle')) +
+      '<div class="flex gap-2 mb-5 flex-wrap">' + chips + '</div>' + list + '</div>';
+  }
 
-    loadLeaderboard();
-  </script>
+  window.__setExploreFilter = function (f) { exploreFilter = f; drawExplore(); };
+  window.__startQuest = function (id) {
+    api('/api/quests/' + id + '/start', { method: 'POST' }).then(function (r) {
+      var q = (state.quests || []).find(function (x) { return x.id === id; });
+      if (q) q.my_status = r.status;
+      drawExplore();
+    }).catch(function () { toast(t('common.error')); });
+  };
+  window.__verifyQuest = function (id) {
+    api('/api/quests/' + id + '/verify', { method: 'POST' }).then(function (r) {
+      var q = (state.quests || []).find(function (x) { return x.id === id; });
+      if (q) q.my_status = r.status;
+      if (r.status === 'verified') {
+        if (q) q.participants++;
+        toast(t('explore.verified_toast', { n: r.xp || (q && q.xp_reward) || 0 }));
+      } else if (r.status === 'pending') {
+        toast(t('explore.pending_toast'));
+      }
+      drawExplore();
+    }).catch(function () { toast(t('common.error')); });
+  };
+
+  // ---- Daily Check-in ----
+  function renderCheckin() {
+    page().innerHTML = pageHeader(t('checkin.title'), t('checkin.subtitle')) + skeleton(2);
+    api('/api/checkin').then(function (data) {
+      if (state.route !== 'checkin') return;
+      drawCheckin(data);
+    }).catch(function () {
+      if (state.route === 'checkin') page().innerHTML = pageHeader(t('checkin.title'), t('checkin.subtitle')) + errorBanner('__retryPage');
+    });
+  }
+
+  function drawCheckin(data) {
+    // 30-day calendar grid ending today
+    var days = new Set(data.days || []);
+    var cells = '';
+    var today = new Date(data.today + 'T00:00:00');
+    for (var i = 29; i >= 0; i--) {
+      var d = new Date(today); d.setDate(d.getDate() - i);
+      var isoDay = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+      var done = days.has(isoDay);
+      var isToday = i === 0;
+      cells += '<div class="aspect-square rounded-lg flex items-center justify-center text-[10px] font-medium ' +
+        (done ? 'bg-indigo-500 text-white' :
+          'bg-zinc-100 dark:bg-zinc-800/80 text-zinc-400 dark:text-zinc-600') +
+        (isToday ? ' ring-2 ring-indigo-400 dark:ring-indigo-500' : '') + '">' + d.getDate() + '</div>';
+    }
+
+    page().innerHTML = '<div class="fade-in">' + pageHeader(t('checkin.title'), t('checkin.subtitle')) +
+      '<div class="grid gap-4 md:grid-cols-2">' +
+      card('<div class="p-6 flex flex-col items-center text-center gap-4">' +
+        '<div class="flex items-center gap-2 text-orange-500">' + icon('flame', 'w-8 h-8') +
+        '<span class="text-4xl font-semibold tracking-tight text-zinc-900 dark:text-zinc-100">' + data.streak + '</span></div>' +
+        '<div class="text-sm text-zinc-500 dark:text-zinc-400">' + esc(t('checkin.streak')) + ' · ' +
+        esc(t('checkin.longest')) + ': <span class="font-medium text-zinc-700 dark:text-zinc-300">' + data.longest + '</span></div>' +
+        (data.checked_in_today
+          ? '<div class="w-full py-3 rounded-xl bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 text-sm font-medium">' + esc(t('checkin.done')) + '</div>'
+          : '<button id="checkin-btn" onclick="__doCheckin()" class="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 active:scale-[.98] text-white font-medium transition-all">' + esc(t('checkin.button')) + '</button>') +
+        '<p class="text-xs text-zinc-400 dark:text-zinc-500 leading-relaxed">' + esc(t('checkin.note')) + '</p></div>') +
+      card('<div class="p-5"><div class="text-sm font-medium mb-3">' + esc(t('checkin.last30')) + '</div>' +
+        '<div class="grid grid-cols-10 gap-1.5">' + cells + '</div>' +
+        '<div class="mt-4 flex gap-4 text-xs text-zinc-400 dark:text-zinc-500">' +
+        '<span class="inline-flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-indigo-500 inline-block"></span>Check-in</span>' +
+        '<span class="inline-flex items-center gap-1.5"><span class="w-3 h-3 rounded bg-zinc-200 dark:bg-zinc-800 inline-block"></span>—</span></div></div>') +
+      '</div></div>';
+  }
+
+  window.__doCheckin = function () {
+    var btn = document.getElementById('checkin-btn');
+    if (btn) btn.disabled = true;
+    api('/api/checkin', { method: 'POST' }).then(function (r) {
+      toast(r.milestone ? t('checkin.milestone', { d: r.milestone }) : t('checkin.success', { n: r.xp_earned }));
+      renderCheckin();
+    }).catch(function (e) {
+      if (e.status === 409) { renderCheckin(); return; }
+      if (btn) btn.disabled = false;
+      toast(t('common.error'));
+    });
+  };
+
+  // ---- Leaderboard ----
+  var lbPeriod = 'weekly';
+  function renderLeaderboard() {
+    page().innerHTML = pageHeader(t('lb.title'), t('lb.subtitle')) + skeleton(4);
+    api('/api/leaderboard?period=' + lbPeriod).then(function (data) {
+      if (state.route !== 'leaderboard') return;
+      drawLeaderboard(data);
+    }).catch(function () {
+      if (state.route === 'leaderboard') page().innerHTML = pageHeader(t('lb.title'), t('lb.subtitle')) + errorBanner('__retryPage');
+    });
+  }
+
+  function drawLeaderboard(data) {
+    var tabs = [['weekly', t('lb.weekly')], ['monthly', t('lb.monthly')], ['all', t('lb.alltime')]]
+      .map(function (c) {
+        var active = lbPeriod === c[0];
+        return '<button onclick="__setLbPeriod(\'' + c[0] + '\')" class="flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-colors ' +
+          (active ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 shadow-sm' : 'text-zinc-500 dark:text-zinc-400') + '">' + esc(c[1]) + '</button>';
+      }).join('');
+
+    var meId = state.profile && state.profile.profile.user_id;
+    var rows = data.leaderboard || [];
+    var body;
+    if (rows.length === 0) {
+      body = card('<div class="p-10 text-center">' +
+        '<div class="mx-auto w-12 h-12 rounded-2xl bg-indigo-50 dark:bg-indigo-500/10 text-indigo-500 flex items-center justify-center mb-3">' + icon('trophy', 'w-6 h-6') + '</div>' +
+        '<p class="text-sm text-zinc-500 dark:text-zinc-400">' + esc(t('lb.empty')) + '</p></div>');
+    } else {
+      body = card('<div class="divide-y divide-zinc-100 dark:divide-zinc-800">' + rows.map(function (r) {
+        var isMe = r.user_id === meId;
+        var rankBadge = r.rank <= 3
+          ? '<span class="w-8 h-8 rounded-full flex items-center justify-center text-sm font-semibold ' +
+            (r.rank === 1 ? 'bg-amber-100 dark:bg-amber-500/15 text-amber-600 dark:text-amber-400' :
+             r.rank === 2 ? 'bg-zinc-200 dark:bg-zinc-700/60 text-zinc-600 dark:text-zinc-300' :
+             'bg-orange-100 dark:bg-orange-500/15 text-orange-600 dark:text-orange-400') + '">' + r.rank + '</span>'
+          : '<span class="w-8 h-8 flex items-center justify-center text-sm text-zinc-400 dark:text-zinc-500 font-medium">' + r.rank + '</span>';
+        return '<div class="px-4 py-3 flex items-center gap-3 ' + (isMe ? 'bg-indigo-50/60 dark:bg-indigo-500/10' : '') + '">' +
+          rankBadge +
+          '<div class="min-w-0 flex-1"><span class="text-sm font-medium truncate">' + esc(r.username) + '</span>' +
+          (isMe ? ' <span class="text-[11px] px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-500/20 text-indigo-700 dark:text-indigo-300 font-medium">' + esc(t('lb.you')) + '</span>' : '') +
+          '<div class="text-xs text-zinc-400 dark:text-zinc-500">' + esc(t('dash.level')) + ' ' + r.level + '</div></div>' +
+          '<span class="font-mono text-sm font-medium">' + r.xp + '</span></div>';
+      }).join('') + '</div>');
+    }
+
+    var meRow = '';
+    if (data.me) {
+      meRow = card('<div class="px-4 py-3 flex items-center justify-between text-sm">' +
+        '<span class="text-zinc-500 dark:text-zinc-400">' + esc(t('lb.your_rank')) + '</span>' +
+        '<span class="font-semibold">#' + data.me.rank + ' · ' + data.me.xp + ' ' + esc(t('lb.points')) + '</span></div>', 'mt-3 border-indigo-200 dark:border-indigo-500/30');
+    } else if (rows.length > 0) {
+      meRow = '<p class="mt-3 text-xs text-zinc-400 dark:text-zinc-500 text-center">' + esc(t('lb.unranked')) + '</p>';
+    }
+
+    page().innerHTML = '<div class="fade-in">' + pageHeader(t('lb.title'), t('lb.subtitle')) +
+      '<div class="flex gap-1 p-1 rounded-xl bg-zinc-200/60 dark:bg-zinc-800/60 mb-5 max-w-md">' + tabs + '</div>' +
+      body + meRow + '</div>';
+  }
+  window.__setLbPeriod = function (p) { lbPeriod = p; renderLeaderboard(); };
+
+  // ---- Settings ----
+  function renderSettings() {
+    var draw = function () {
+      if (state.route !== 'settings') return;
+      var p = state.profile && state.profile.profile;
+      var isDark = document.documentElement.classList.contains('dark');
+      var langBtn = function (code, label) {
+        var active = state.lang === code;
+        return '<button onclick="__setLanguage(\'' + code + '\')" class="flex-1 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors ' +
+          (active ? 'bg-indigo-600 text-white shadow-sm' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100') + '">' + label + '</button>';
+      };
+      var themeBtn = function (theme, label) {
+        var active = (theme === 'dark') === isDark;
+        return '<button onclick="__setTheme(\'' + theme + '\')" class="flex-1 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors ' +
+          (active ? 'bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 shadow-sm' : 'text-zinc-500 dark:text-zinc-400') + '">' + esc(label) + '</button>';
+      };
+      var pubkey = p && p.usernode_pubkey;
+      var shortKey = pubkey ? pubkey.slice(0, 10) + '…' + pubkey.slice(-6) : null;
+
+      var moreLinks = NAV.main.concat(NAV.me, NAV.more).filter(function (i) {
+        return ['campaigns', 'rewards', 'wallet', 'badges', 'referral', 'community', 'notifications', 'help'].indexOf(i.key) !== -1;
+      }).map(function (i) {
+        return '<button data-nav="' + i.key + '" class="flex items-center gap-3 px-4 py-3 text-sm text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 w-full text-left">' +
+          icon(i.icon, 'w-[18px] h-[18px] text-zinc-400 dark:text-zinc-500') + esc(t('nav.' + i.key)) + '</button>';
+      }).join('');
+
+      page().innerHTML = '<div class="fade-in max-w-2xl">' + pageHeader(t('settings.title')) +
+        '<div class="space-y-5">' +
+
+        card('<div class="p-5"><div class="font-medium text-sm mb-1">' + esc(t('settings.language')) + '</div>' +
+          '<p class="text-xs text-zinc-500 dark:text-zinc-400 mb-3">' + esc(t('settings.language_note')) + '</p>' +
+          '<div id="lang-switcher" class="flex gap-1 p-1 rounded-xl bg-zinc-200/60 dark:bg-zinc-800/60 max-w-sm">' +
+          langBtn('id', 'Bahasa Indonesia') + langBtn('en', 'English') + '</div></div>') +
+
+        card('<div class="p-5"><div class="font-medium text-sm mb-3">' + esc(t('settings.theme')) + '</div>' +
+          '<div class="flex gap-1 p-1 rounded-xl bg-zinc-200/60 dark:bg-zinc-800/60 max-w-sm">' +
+          themeBtn('dark', t('settings.dark')) + themeBtn('light', t('settings.light')) + '</div></div>') +
+
+        card('<div class="p-5"><div class="font-medium text-sm mb-3">' + esc(t('settings.account')) + '</div>' +
+          '<div class="space-y-2 text-sm">' +
+          '<div class="flex justify-between gap-4"><span class="text-zinc-500 dark:text-zinc-400">Username</span><span class="font-medium">' + esc(p ? p.username : '—') + '</span></div>' +
+          '<div class="flex justify-between gap-4"><span class="text-zinc-500 dark:text-zinc-400">' + esc(t('settings.wallet_identity')) + '</span>' +
+          '<span class="font-mono text-xs">' + esc(shortKey || t('settings.not_linked')) + '</span></div>' +
+          '<div class="flex justify-between gap-4"><span class="text-zinc-500 dark:text-zinc-400">' + esc(t('dash.level')) + '</span><span class="font-medium">' + (p ? p.level : '—') + ' · ' + (p ? p.total_xp : 0) + ' XP</span></div>' +
+          '</div></div>') +
+
+        card('<div class="py-1"><div class="px-4 pt-3 pb-1 text-xs font-medium uppercase tracking-wider text-zinc-400 dark:text-zinc-500">' + esc(t('settings.more')) + '</div>' +
+          '<div class="divide-y divide-zinc-100 dark:divide-zinc-800">' + moreLinks + '</div></div>') +
+
+        '</div></div>';
+    };
+    if (state.profile) draw();
+    else { page().innerHTML = skeleton(3); loadProfile().then(draw).catch(draw); }
+  }
+
+  // ---- Stub pages (follow-up slices) ----
+  var STUBS = {
+    campaigns: { icon: 'megaphone', cta: false },
+    rewards: { icon: 'gift', cta: true },
+    badges: { icon: 'badge', cta: true },
+    referral: { icon: 'link', cta: false },
+    wallet: { icon: 'wallet', cta: false },
+    community: { icon: 'users', cta: false },
+    notifications: { icon: 'bell', cta: false },
+    help: { icon: 'help', cta: false },
+  };
+  function renderStub(key) {
+    var cfg = STUBS[key];
+    page().innerHTML = '<div class="fade-in">' + pageHeader(t('nav.' + key)) +
+      card('<div class="p-10 md:p-14 text-center">' +
+        '<div class="mx-auto w-14 h-14 rounded-2xl bg-indigo-50 dark:bg-indigo-500/10 text-indigo-500 flex items-center justify-center mb-4">' + icon(cfg.icon, 'w-7 h-7') + '</div>' +
+        '<p class="text-sm text-zinc-600 dark:text-zinc-300 mb-1">' + esc(t('stub.' + key)) + '</p>' +
+        '<p class="text-xs text-zinc-400 dark:text-zinc-500 mb-5">' + esc(t('common.soon')) + '</p>' +
+        (cfg.cta ? '<button data-nav="explore" class="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium">' + esc(t('common.explore_cta')) + '</button>' : '') +
+        '</div>') + '</div>';
+  }
+
+  // ------------------------------------------------------------------
+  // Router
+  // ------------------------------------------------------------------
+  var PAGES = {
+    dashboard: renderDashboard,
+    explore: renderExplore,
+    checkin: renderCheckin,
+    leaderboard: renderLeaderboard,
+    settings: renderSettings,
+  };
+
+  function renderAll() {
+    renderSidenav();
+    renderBottomNav();
+    var fn = PAGES[state.route];
+    if (fn) fn(); else renderStub(state.route);
+  }
+  window.__retryPage = renderAll;
+
+  // ------------------------------------------------------------------
+  // Boot
+  // ------------------------------------------------------------------
+  document.documentElement.lang = state.lang;
+  state.route = routeFromPath();
+  renderAll();
+  // Warm the profile so Settings/leaderboard "you" markers have data, and to
+  // adopt the server-stored language preference (source of truth).
+  loadProfile().catch(function () {});
+})();
+</script>
 </body>
 </html>

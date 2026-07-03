@@ -1,3 +1,11 @@
 {
-  "secrets": []
+  "name": "NexaQuest",
+  "secrets": [],
+  "tests": [
+    { "name": "Dashboard renders", "path": "/", "expectText": "NexaQuest" },
+    { "name": "Explore lists seeded quests", "path": "/explore", "expectText": "Staging demo quest #1" },
+    { "name": "Daily check-in page", "path": "/checkin", "expectSelector": "#checkin-btn" },
+    { "name": "Leaderboard shows seeded users", "path": "/leaderboard", "expectText": "staging-demo" },
+    { "name": "Settings language switcher", "path": "/settings", "expectText": "Bahasa Indonesia" }
+  ]
 }
