@@ -66,18 +66,48 @@
   <title>NEXA QUEST</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>tailwind.config = { darkMode: 'class' }</script>
+  <style>
+    body {
+      background-color: #030307;
+      background-image:
+        radial-gradient(ellipse 80% 50% at 20% -10%, rgba(34, 211, 238, 0.12), transparent),
+        radial-gradient(ellipse 80% 50% at 80% 110%, rgba(217, 70, 239, 0.12), transparent);
+    }
+    .neon-title {
+      background: linear-gradient(90deg, #22d3ee, #d946ef);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      filter: drop-shadow(0 0 14px rgba(34, 211, 238, 0.45));
+    }
+    .neon-btn {
+      background: radial-gradient(circle at 35% 30%, rgba(217, 70, 239, 0.35), rgba(3, 3, 7, 0.9) 70%);
+      border: 2px solid #22d3ee;
+      box-shadow: 0 0 18px rgba(34, 211, 238, 0.55), inset 0 0 22px rgba(217, 70, 239, 0.35);
+      color: #67e8f9;
+      text-shadow: 0 0 10px rgba(34, 211, 238, 0.9);
+    }
+    .neon-btn:hover {
+      border-color: #d946ef;
+      box-shadow: 0 0 28px rgba(217, 70, 239, 0.65), inset 0 0 26px rgba(34, 211, 238, 0.35);
+      color: #f0abfc;
+      text-shadow: 0 0 10px rgba(217, 70, 239, 0.9);
+    }
+    .neon-glow-cyan { text-shadow: 0 0 12px rgba(34, 211, 238, 0.7); }
+    .neon-glow-magenta { text-shadow: 0 0 12px rgba(217, 70, 239, 0.7); }
+  </style>
 </head>
-<body class="bg-zinc-950 text-zinc-100 min-h-screen flex flex-col items-center justify-center gap-8 p-4">
-  <h1 class="text-2xl font-bold">NEXA QUEST</h1>
+<body class="text-zinc-100 min-h-screen flex flex-col items-center justify-center gap-8 p-4">
+  <h1 class="text-3xl font-black uppercase tracking-widest neon-title">NEXA QUEST</h1>
 
-  <button id="press-btn" class="w-32 h-32 rounded-full bg-violet-600 hover:bg-violet-500 active:scale-95 transition-all text-white text-xl font-bold shadow-lg shadow-violet-600/30">
+  <button id="press-btn" class="w-32 h-32 rounded-full neon-btn active:scale-95 transition-all text-xl font-bold uppercase tracking-wider">
     Press!
   </button>
 
-  <div id="count" class="text-lg text-zinc-400">0 total presses</div>
+  <div id="count" class="text-lg font-mono text-cyan-300 neon-glow-cyan">0 total presses</div>
 
   <div class="w-full max-w-sm">
-    <h2 class="text-sm font-medium text-zinc-500 mb-2 text-center">Leaderboard</h2>
+    <h2 class="text-sm font-semibold uppercase tracking-[0.3em] text-fuchsia-400 neon-glow-magenta mb-2 text-center">Leaderboard</h2>
     <div id="leaderboard" class="space-y-1"></div>
   </div>
 
@@ -92,11 +122,11 @@
       const { leaderboard } = await res.json();
       const el = document.getElementById('leaderboard');
       if (!leaderboard.length) {
-        el.innerHTML = '<p class="text-center text-zinc-600 text-sm">No presses yet</p>';
+        el.innerHTML = '<p class="text-center text-zinc-500 text-sm">No presses yet</p>';
         return;
       }
       el.innerHTML = leaderboard.map((r, i) =>
-        '<div class="flex justify-between px-3 py-1 rounded ' + (i === 0 ? 'bg-violet-600/20 text-violet-300' : 'text-zinc-400') + '">' +
+        '<div class="flex justify-between px-3 py-1 rounded border ' + (i === 0 ? 'border-cyan-400/60 bg-cyan-400/10 text-cyan-300 shadow-[0_0_12px_rgba(34,211,238,0.35)]' : 'border-fuchsia-500/20 bg-fuchsia-500/5 text-zinc-300') + '">' +
         '<span>' + (i + 1) + '. ' + r.username + '</span>' +
         '<span class="font-mono">' + r.presses + '</span></div>'
       ).join('');

@@ -1,3 +1,6 @@
 {
-  "secrets": []
+  "secrets": [],
+  "tests": [
+    { "name": "Home renders with neon theme", "path": "/", "expectSelector": "#press-btn", "expectText": "NEXA QUEST" }
+  ]
 }
