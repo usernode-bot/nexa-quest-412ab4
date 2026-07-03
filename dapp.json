@@ -1,3 +1,30 @@
 {
-  "secrets": []
+  "secrets": [],
+  "tests": [
+    {
+      "name": "Dashboard loads with user profile",
+      "path": "/",
+      "expectSelector": ".xp-progress"
+    },
+    {
+      "name": "Explore Quests page displays quest cards",
+      "path": "/explore",
+      "expectSelector": ".quest-card"
+    },
+    {
+      "name": "Check-in system with daily streak and calendar",
+      "path": "/check-in",
+      "expectSelector": ".calendar-grid"
+    },
+    {
+      "name": "Leaderboard displays ranked users",
+      "path": "/leaderboard",
+      "expectSelector": ".leaderboard-user"
+    },
+    {
+      "name": "Language toggle switches interface language",
+      "path": "/settings",
+      "expectSelector": ".language-toggle"
+    }
+  ]
 }
