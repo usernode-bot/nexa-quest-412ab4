@@ -1,0 +1,10 @@
+Error: connect ECONNREFUSED 127.0.0.1:5432
+    at /home/node/workspace/node_modules/pg-pool/index.js:45:11
+    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+    at async start (/home/node/workspace/server.js:173:3) {
+  errno: -111,
+  code: 'ECONNREFUSED',
+  syscall: 'connect',
+  address: '127.0.0.1',
+  port: 5432
+}
