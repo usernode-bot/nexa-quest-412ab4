@@ -84,10 +84,12 @@
   <script>
     const params = new URLSearchParams(window.location.search);
     const token = params.get('token') || '';
+    const demo = params.get('demo') || '';
     const headers = token ? { 'x-usernode-token': token } : {};
 
     async function loadLeaderboard() {
-      const res = await fetch('/api/leaderboard', { headers });
+      const qs = demo ? '?demo=' + encodeURIComponent(demo) : '';
+      const res = await fetch('/api/leaderboard' + qs, { headers });
       if (!res.ok) return;
       const { leaderboard } = await res.json();
       const el = document.getElementById('leaderboard');

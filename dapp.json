@@ -1,3 +1,7 @@
 {
-  "secrets": []
+  "secrets": [],
+  "tests": [
+    { "name": "Press button renders", "path": "/", "expectSelector": "#press-btn" },
+    { "name": "Leaderboard renders", "path": "/?demo=1", "expectSelector": "#leaderboard" }
+  ]
 }

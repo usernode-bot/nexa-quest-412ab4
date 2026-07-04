@@ -7,11 +7,14 @@ const app = express();
 const port = process.env.PORT || 3000;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const JWT_SECRET = process.env.JWT_SECRET;
+const IS_STAGING = process.env.USERNODE_ENV === 'staging';
 
 // Paths that stay open without authentication. Add a path here (and add it
 // with `app.get`/`app.post` below) if you deliberately want it public.
 // Everything else requires a valid platform-issued JWT.
-const PUBLIC_API_PATHS = new Set(['/health']);
+// `/` is public so the platform's headless checks (dapp.json `tests`) can
+// load the HTML shell and assert on its selectors without a token.
+const PUBLIC_API_PATHS = new Set(['/health', '/']);
 
 app.use(express.json());
 
@@ -25,11 +28,16 @@ app.use((req, res, next) => {
     try { req.user = jwt.verify(token, JWT_SECRET); } catch {}
   }
 
+  // Staging-only demo leaderboard bypass so the platform's headless checks
+  // and testers can load it without a token. See "Staging mock data".
+  const isDemoLeaderboard = IS_STAGING && req.path === '/api/leaderboard' && req.query.demo === '1';
+
   // Static assets (CSS/JS/images) are always served; the API and the HTML
   // shell are gated so direct hits to the staging/prod subdomain don't
   // leak app data to the public internet.
   if (req.method !== 'GET' || req.path.startsWith('/api/')) {
     if (PUBLIC_API_PATHS.has(req.path)) return next();
+    if (isDemoLeaderboard) return next();
     if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
   }
   next();
@@ -50,7 +58,19 @@ app.post('/api/press', async (req, res) => {
 });
 
 // Leaderboard
-app.get('/api/leaderboard', async (_req, res) => {
+app.get('/api/leaderboard', async (req, res) => {
+  // Staging-only demo data so the platform's headless checks (and testers
+  // on a fresh, empty staging DB) see a populated leaderboard without
+  // needing auth. No-op in production — see "Staging mock data" convention.
+  if (IS_STAGING && req.query.demo === '1') {
+    return res.json({
+      leaderboard: [
+        { username: 'staging-demo-alice', presses: '42' },
+        { username: 'staging-demo-bob', presses: '37' },
+        { username: 'staging-demo-carol', presses: '19' },
+      ],
+    });
+  }
   try {
     const { rows } = await pool.query(`
       SELECT username, COUNT(*) as presses
@@ -67,10 +87,12 @@ app.get('/api/leaderboard', async (_req, res) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// HTML shell: serve the app if authenticated, otherwise an "open in Usernode"
-// landing page so stray visits to the staging URL don't reveal the app.
+// HTML shell: serve the app if authenticated (or the route is explicitly
+// public, e.g. `/` for the platform's headless checks), otherwise an "open
+// in Usernode" landing page so stray visits to the staging URL don't reveal
+// the app.
 app.get('*', (req, res) => {
-  if (!req.user) {
+  if (!req.user && !PUBLIC_API_PATHS.has(req.path)) {
     return res.status(401).send(`<!doctype html><meta charset=utf-8><title>Open in Usernode</title>
 <body style="font-family:system-ui;background:#09090b;color:#e4e4e7;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
   <div style="max-width:24rem;padding:2rem;text-align:center">
