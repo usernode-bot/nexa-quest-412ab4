@@ -87,21 +87,31 @@
     const headers = token ? { 'x-usernode-token': token } : {};
 
     async function loadLeaderboard() {
-      const res = await fetch('/api/leaderboard', { headers });
-      if (!res.ok) return;
-      const { leaderboard } = await res.json();
       const el = document.getElementById('leaderboard');
-      if (!leaderboard.length) {
-        el.innerHTML = '<p class="text-center text-zinc-600 text-sm">No presses yet</p>';
+      // No token means we're an unauthenticated visit (e.g. a direct/anonymous
+      // load) — the leaderboard API requires auth, so skip the call rather
+      // than let it 401 (a failed fetch logs a console error even when the
+      // response is handled gracefully in JS).
+      if (!token) {
+        el.innerHTML = '<p class="text-center text-zinc-600 text-sm">Sign in to see the leaderboard</p>';
         return;
       }
-      el.innerHTML = leaderboard.map((r, i) =>
-        '<div class="flex justify-between px-3 py-1 rounded ' + (i === 0 ? 'bg-violet-600/20 text-violet-300' : 'text-zinc-400') + '">' +
-        '<span>' + (i + 1) + '. ' + r.username + '</span>' +
-        '<span class="font-mono">' + r.presses + '</span></div>'
-      ).join('');
-      const total = leaderboard.reduce((s, r) => s + parseInt(r.presses), 0);
-      document.getElementById('count').textContent = total + ' total presses';
+      try {
+        const res = await fetch('/api/leaderboard', { headers });
+        if (!res.ok) return;
+        const { leaderboard } = await res.json();
+        if (!leaderboard.length) {
+          el.innerHTML = '<p class="text-center text-zinc-600 text-sm">No presses yet</p>';
+          return;
+        }
+        el.innerHTML = leaderboard.map((r, i) =>
+          '<div class="flex justify-between px-3 py-1 rounded ' + (i === 0 ? 'bg-violet-600/20 text-violet-300' : 'text-zinc-400') + '">' +
+          '<span>' + (i + 1) + '. ' + r.username + '</span>' +
+          '<span class="font-mono">' + r.presses + '</span></div>'
+        ).join('');
+        const total = leaderboard.reduce((s, r) => s + parseInt(r.presses), 0);
+        document.getElementById('count').textContent = total + ' total presses';
+      } catch {}
     }
 
     document.getElementById('press-btn').addEventListener('click', async () => {
