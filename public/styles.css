@@ -1,0 +1,244 @@
+/* NEXA QUEST — self-contained stylesheet (no external CDN).
+   Dark/violet look, plus a light theme toggled by [data-theme="light"]. */
+
+:root {
+  --bg: #09090b;
+  --surface: #18181b;
+  --surface-2: #27272a;
+  --border: #27272a;
+  --text: #f4f4f5;
+  --muted: #a1a1aa;
+  --faint: #71717a;
+  --accent: #7c3aed;
+  --accent-hover: #8b5cf6;
+  --accent-soft: rgba(124, 58, 237, 0.18);
+  --accent-text: #c4b5fd;
+}
+
+html[data-theme="light"] {
+  --bg: #fafafa;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --border: #e4e4e7;
+  --text: #18181b;
+  --muted: #52525b;
+  --faint: #71717a;
+  --accent: #7c3aed;
+  --accent-hover: #6d28d9;
+  --accent-soft: rgba(124, 58, 237, 0.12);
+  --accent-text: #6d28d9;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  max-width: 30rem;
+  margin: 0 auto;
+  padding: 1.25rem 1rem 3rem;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+/* Header + nav */
+.brand {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+.brand h1 {
+  font-size: 1.15rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  margin: 0;
+}
+.staging-badge {
+  font-size: 0.65rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+}
+
+.nav {
+  display: flex;
+  gap: 0.25rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  padding: 0.25rem;
+  margin-bottom: 1.5rem;
+  overflow-x: auto;
+}
+.nav a {
+  flex: 1 0 auto;
+  text-align: center;
+  text-decoration: none;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 0.45rem 0.6rem;
+  border-radius: 0.55rem;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+.nav a:hover { color: var(--text); }
+.nav a.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* Cards & generic pieces */
+.screen { flex: 1; }
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  padding: 1.1rem;
+  margin-bottom: 1rem;
+}
+.screen-title {
+  font-size: 1.35rem;
+  font-weight: 800;
+  margin: 0 0 0.25rem;
+}
+.screen-sub {
+  color: var(--muted);
+  font-size: 0.9rem;
+  margin: 0 0 1.25rem;
+}
+.muted { color: var(--muted); }
+.faint { color: var(--faint); }
+.empty {
+  text-align: center;
+  color: var(--faint);
+  font-size: 0.9rem;
+  padding: 0.75rem 0;
+}
+
+/* Buttons */
+.btn {
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-weight: 700;
+  border-radius: 0.6rem;
+  padding: 0.6rem 1rem;
+  background: var(--accent);
+  color: #fff;
+  transition: background 0.15s, transform 0.08s;
+}
+.btn:hover { background: var(--accent-hover); }
+.btn:active { transform: scale(0.97); }
+.btn:disabled { opacity: 0.55; cursor: default; transform: none; }
+.btn-ghost {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.btn-ghost:hover { background: var(--border); }
+
+.press-btn {
+  width: 8rem;
+  height: 8rem;
+  border-radius: 999px;
+  font-size: 1.25rem;
+  box-shadow: 0 10px 30px -8px var(--accent-soft);
+  margin: 0.5rem auto 0;
+  display: block;
+}
+
+.center { text-align: center; }
+.stack { display: flex; flex-direction: column; gap: 0.75rem; }
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+/* Stats */
+.stat-value {
+  font-size: 2rem;
+  font-weight: 800;
+  color: var(--accent-text);
+}
+.stat-label {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+/* Leaderboard / list rows */
+.list { display: flex; flex-direction: column; gap: 0.35rem; }
+.rank-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.55rem 0.75rem;
+  border-radius: 0.55rem;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.rank-row.top {
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-weight: 700;
+}
+.rank-row .count { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+
+/* Quest cards */
+.quest {
+  border: 1px solid var(--border);
+  border-radius: 0.7rem;
+  padding: 0.85rem;
+  background: var(--surface-2);
+}
+.quest h3 { margin: 0 0 0.2rem; font-size: 0.98rem; }
+.quest p { margin: 0 0 0.5rem; font-size: 0.85rem; color: var(--muted); }
+.quest .points {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+}
+
+/* Settings controls */
+.field { margin-bottom: 1rem; }
+.field label {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+.seg { display: inline-flex; background: var(--surface-2); border-radius: 0.55rem; padding: 0.2rem; gap: 0.2rem; }
+.seg button {
+  border: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-weight: 600;
+  font-size: 0.82rem;
+  padding: 0.35rem 0.8rem;
+  border-radius: 0.4rem;
+  background: transparent;
+  color: var(--muted);
+}
+.seg button.active { background: var(--accent); color: #fff; }
+.value-pill {
+  font-family: ui-monospace, monospace;
+  font-size: 0.9rem;
+  color: var(--text);
+}

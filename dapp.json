@@ -1,3 +1,11 @@
 {
-  "secrets": []
+  "name": "NEXA QUEST",
+  "secrets": [],
+  "tests": [
+    { "name": "Home renders", "path": "/", "expectSelector": "#press-btn" },
+    { "name": "Explore lists quests", "path": "/explore", "expectText": "Staging demo Quest:" },
+    { "name": "Check-in populated", "path": "/check-in?demo=1", "expectSelector": "#checkin-btn" },
+    { "name": "Leaderboard ranked", "path": "/leaderboard", "expectText": "Staging demo Aria" },
+    { "name": "Settings opens", "path": "/settings", "expectSelector": "#theme-seg" }
+  ]
 }

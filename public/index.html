@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  
+
   <script>
   // usernode-dev-console@1
   (function () {
@@ -64,58 +64,351 @@
   })();
   </script>
   <title>NEXA QUEST</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>tailwind.config = { darkMode: 'class' }</script>
+  <link rel="stylesheet" href="/styles.css">
 </head>
-<body class="bg-zinc-950 text-zinc-100 min-h-screen flex flex-col items-center justify-center gap-8 p-4">
-  <h1 class="text-2xl font-bold">NEXA QUEST</h1>
+<body>
+  <div class="app">
+    <div class="brand">
+      <h1>NEXA QUEST</h1>
+      <span id="staging-badge" class="staging-badge" style="display:none">staging</span>
+    </div>
 
-  <button id="press-btn" class="w-32 h-32 rounded-full bg-violet-600 hover:bg-violet-500 active:scale-95 transition-all text-white text-xl font-bold shadow-lg shadow-violet-600/30">
-    Press!
-  </button>
+    <nav class="nav" id="nav">
+      <a href="/" data-route="/" data-i18n="nav_home">Home</a>
+      <a href="/explore" data-route="/explore" data-i18n="nav_explore">Explore</a>
+      <a href="/check-in" data-route="/check-in" data-i18n="nav_checkin">Check-in</a>
+      <a href="/leaderboard" data-route="/leaderboard" data-i18n="nav_leaderboard">Leaderboard</a>
+      <a href="/settings" data-route="/settings" data-i18n="nav_settings">Settings</a>
+    </nav>
 
-  <div id="count" class="text-lg text-zinc-400">0 total presses</div>
-
-  <div class="w-full max-w-sm">
-    <h2 class="text-sm font-medium text-zinc-500 mb-2 text-center">Leaderboard</h2>
-    <div id="leaderboard" class="space-y-1"></div>
+    <main class="screen" id="screen"></main>
   </div>
 
   <script>
-    const params = new URLSearchParams(window.location.search);
-    const token = params.get('token') || '';
-    const headers = token ? { 'x-usernode-token': token } : {};
+  (function () {
+    'use strict';
 
-    async function loadLeaderboard() {
-      const res = await fetch('/api/leaderboard', { headers });
-      if (!res.ok) return;
-      const { leaderboard } = await res.json();
-      const el = document.getElementById('leaderboard');
-      if (!leaderboard.length) {
-        el.innerHTML = '<p class="text-center text-zinc-600 text-sm">No presses yet</p>';
-        return;
-      }
-      el.innerHTML = leaderboard.map((r, i) =>
-        '<div class="flex justify-between px-3 py-1 rounded ' + (i === 0 ? 'bg-violet-600/20 text-violet-300' : 'text-zinc-400') + '">' +
-        '<span>' + (i + 1) + '. ' + r.username + '</span>' +
-        '<span class="font-mono">' + r.presses + '</span></div>'
-      ).join('');
-      const total = leaderboard.reduce((s, r) => s + parseInt(r.presses), 0);
-      document.getElementById('count').textContent = total + ' total presses';
+    // ----- Token propagation -------------------------------------------------
+    // The platform injects ?token=… on the initial load. Capture it once and
+    // forward it on every /api/* request via the x-usernode-token header so
+    // deep links and client-side navigation stay authenticated.
+    var params = new URLSearchParams(window.location.search);
+    var TOKEN = params.get('token') || '';
+    var DEMO = params.get('demo') === '1';
+
+    function api(path, opts) {
+      opts = opts || {};
+      opts.headers = Object.assign(
+        { 'Content-Type': 'application/json' },
+        TOKEN ? { 'x-usernode-token': TOKEN } : {},
+        opts.headers || {}
+      );
+      return fetch(path, opts);
     }
 
-    document.getElementById('press-btn').addEventListener('click', async () => {
-      try {
-        const res = await fetch('/api/press', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', ...headers },
+    // Keep ?token (and ?demo) on internal navigations so we never drop auth.
+    function withQuery(pathname) {
+      var q = new URLSearchParams();
+      if (TOKEN) q.set('token', TOKEN);
+      if (DEMO) q.set('demo', '1');
+      var s = q.toString();
+      return s ? pathname + '?' + s : pathname;
+    }
+
+    // ----- i18n --------------------------------------------------------------
+    var STRINGS = {
+      en: {
+        nav_home: 'Home', nav_explore: 'Explore', nav_checkin: 'Check-in',
+        nav_leaderboard: 'Leaderboard', nav_settings: 'Settings',
+        home_hello: 'Welcome', home_points: 'quest points', home_press: 'Press!',
+        home_sub: 'Tap to log quest activity and climb the ranks.',
+        home_total: 'total presses so far',
+        explore_title: 'Explore quests', explore_sub: 'Pick a quest and start earning points.',
+        explore_empty: 'No quests available yet.',
+        checkin_title: 'Daily check-in', checkin_sub: 'Check in each day to keep your streak alive.',
+        checkin_btn: 'Check in for today', checkin_done: 'Checked in for today ✓',
+        checkin_history: 'Recent check-ins', checkin_empty: 'No check-ins yet.',
+        lb_title: 'Leaderboard', lb_sub: 'Top questers by presses.', lb_empty: 'No presses yet.',
+        settings_title: 'Settings', settings_sub: 'Personalize your NEXA QUEST.',
+        settings_name: 'Display name', settings_lang: 'Language', settings_theme: 'Theme',
+        theme_dark: 'Dark', theme_light: 'Light', signed_out: 'Sign in to play.'
+      },
+      id: {
+        nav_home: 'Beranda', nav_explore: 'Jelajah', nav_checkin: 'Check-in',
+        nav_leaderboard: 'Papan Skor', nav_settings: 'Pengaturan',
+        home_hello: 'Selamat datang', home_points: 'poin quest', home_press: 'Tekan!',
+        home_sub: 'Ketuk untuk mencatat aktivitas quest dan naik peringkat.',
+        home_total: 'total tekanan sejauh ini',
+        explore_title: 'Jelajahi quest', explore_sub: 'Pilih quest dan mulai kumpulkan poin.',
+        explore_empty: 'Belum ada quest tersedia.',
+        checkin_title: 'Check-in harian', checkin_sub: 'Check-in setiap hari untuk menjaga streak.',
+        checkin_btn: 'Check-in hari ini', checkin_done: 'Sudah check-in hari ini ✓',
+        checkin_history: 'Check-in terbaru', checkin_empty: 'Belum ada check-in.',
+        lb_title: 'Papan Skor', lb_sub: 'Quester teratas berdasarkan tekanan.', lb_empty: 'Belum ada tekanan.',
+        settings_title: 'Pengaturan', settings_sub: 'Sesuaikan NEXA QUEST Anda.',
+        settings_name: 'Nama tampilan', settings_lang: 'Bahasa', settings_theme: 'Tema',
+        theme_dark: 'Gelap', theme_light: 'Terang', signed_out: 'Masuk untuk bermain.'
+      }
+    };
+    var lang = localStorage.getItem('nexa_lang') || 'en';
+    if (!STRINGS[lang]) lang = 'en';
+    function t(key) {
+      var table = STRINGS[lang] || STRINGS.en;
+      // Guaranteed fallback so a missing key never throws.
+      return (table && table[key]) || STRINGS.en[key] || key;
+    }
+
+    // ----- Theme -------------------------------------------------------------
+    var theme = localStorage.getItem('nexa_theme') || 'dark';
+    function applyTheme() { document.documentElement.setAttribute('data-theme', theme); }
+    applyTheme();
+
+    // ----- Small DOM helpers -------------------------------------------------
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+    var screenEl = document.getElementById('screen');
+    function setScreen(html) { screenEl.innerHTML = html; }
+
+    // ----- State cache -------------------------------------------------------
+    var me = { username: '' };
+
+    // ----- Screens -----------------------------------------------------------
+    function renderHome() {
+      setScreen(
+        '<h2 class="screen-title">' + t('home_hello') + (me.username ? ', ' + esc(me.username) : '') + '</h2>' +
+        '<p class="screen-sub">' + t('home_sub') + '</p>' +
+        '<div class="card center">' +
+          '<div class="stat-value" id="home-points">0</div>' +
+          '<div class="stat-label">' + t('home_points') + '</div>' +
+          '<button class="btn press-btn" id="press-btn">' + t('home_press') + '</button>' +
+          '<div class="stat-label" id="home-total" style="margin-top:0.75rem">0 ' + t('home_total') + '</div>' +
+        '</div>'
+      );
+      var btn = document.getElementById('press-btn');
+      btn.addEventListener('click', function () {
+        api('/api/press', { method: 'POST' })
+          .then(function (r) { if (r.ok) loadHomeStats(); })
+          .catch(function () {});
+      });
+      loadHomeStats();
+    }
+
+    function loadHomeStats() {
+      api('/api/leaderboard').then(function (r) {
+        if (!r.ok) return null;
+        return r.json();
+      }).then(function (data) {
+        if (!data) return;
+        var board = data.leaderboard || [];
+        var total = board.reduce(function (s, r) { return s + parseInt(r.presses, 10); }, 0);
+        var mine = 0;
+        for (var i = 0; i < board.length; i++) {
+          if (board[i].username === me.username) { mine = parseInt(board[i].presses, 10); break; }
+        }
+        var pts = document.getElementById('home-points');
+        var tot = document.getElementById('home-total');
+        if (pts) pts.textContent = String(mine);
+        if (tot) tot.textContent = total + ' ' + t('home_total');
+      }).catch(function () {});
+    }
+
+    function renderExplore() {
+      setScreen(
+        '<h2 class="screen-title">' + t('explore_title') + '</h2>' +
+        '<p class="screen-sub">' + t('explore_sub') + '</p>' +
+        '<div class="stack" id="quest-list"><div class="empty">…</div></div>'
+      );
+      api('/api/quests').then(function (r) { return r.ok ? r.json() : { quests: [] }; })
+        .then(function (data) {
+          var list = document.getElementById('quest-list');
+          if (!list) return;
+          var quests = (data && data.quests) || [];
+          if (!quests.length) { list.innerHTML = '<div class="empty">' + t('explore_empty') + '</div>'; return; }
+          list.innerHTML = quests.map(function (q) {
+            return '<div class="quest">' +
+              '<div class="row"><h3>' + esc(q.title) + '</h3>' +
+              '<span class="points">+' + esc(q.points) + '</span></div>' +
+              '<p>' + esc(q.description) + '</p></div>';
+          }).join('');
+        }).catch(function () {
+          var list = document.getElementById('quest-list');
+          if (list) list.innerHTML = '<div class="empty">' + t('explore_empty') + '</div>';
         });
-        if (res.ok) loadLeaderboard();
-        else if (res.status === 401) document.getElementById('count').textContent = 'Sign in to press!';
-      } catch {}
+    }
+
+    function renderCheckin() {
+      setScreen(
+        '<h2 class="screen-title">' + t('checkin_title') + '</h2>' +
+        '<p class="screen-sub">' + t('checkin_sub') + '</p>' +
+        '<div class="card center">' +
+          '<button class="btn" id="checkin-btn">' + t('checkin_btn') + '</button>' +
+          '<div class="stat-label" id="checkin-status" style="margin-top:0.75rem"></div>' +
+        '</div>' +
+        '<div class="card">' +
+          '<div class="stat-label" style="margin-bottom:0.5rem">' + t('checkin_history') + '</div>' +
+          '<div class="list" id="checkin-list"><div class="empty">…</div></div>' +
+        '</div>'
+      );
+      document.getElementById('checkin-btn').addEventListener('click', function () {
+        api('/api/check-in', { method: 'POST' })
+          .then(function (r) { if (r.ok) loadCheckins(); })
+          .catch(function () {});
+      });
+      loadCheckins();
+    }
+
+    function loadCheckins() {
+      // Forward ?demo=1 so the staging demo "already checked in" state shows.
+      var url = DEMO ? '/api/check-ins?demo=1' : '/api/check-ins';
+      api(url).then(function (r) { return r.ok ? r.json() : { checkins: [], checkedInToday: false }; })
+        .then(function (data) {
+          data = data || { checkins: [], checkedInToday: false };
+          var btn = document.getElementById('checkin-btn');
+          var status = document.getElementById('checkin-status');
+          var list = document.getElementById('checkin-list');
+          if (btn && data.checkedInToday) { btn.disabled = true; }
+          if (status) status.textContent = data.checkedInToday ? t('checkin_done') : '';
+          if (list) {
+            var rows = data.checkins || [];
+            if (!rows.length) { list.innerHTML = '<div class="empty">' + t('checkin_empty') + '</div>'; return; }
+            list.innerHTML = rows.map(function (c) {
+              var when = '';
+              try { when = new Date(c.created_at).toLocaleDateString(); } catch (e) { when = ''; }
+              return '<div class="rank-row"><span>' + esc(c.username) + '</span>' +
+                '<span class="faint">' + esc(when) + '</span></div>';
+            }).join('');
+          }
+        }).catch(function () {
+          var list = document.getElementById('checkin-list');
+          if (list) list.innerHTML = '<div class="empty">' + t('checkin_empty') + '</div>';
+        });
+    }
+
+    function renderLeaderboard() {
+      setScreen(
+        '<h2 class="screen-title">' + t('lb_title') + '</h2>' +
+        '<p class="screen-sub">' + t('lb_sub') + '</p>' +
+        '<div class="card"><div class="list" id="lb-list"><div class="empty">…</div></div></div>'
+      );
+      api('/api/leaderboard').then(function (r) { return r.ok ? r.json() : { leaderboard: [] }; })
+        .then(function (data) {
+          var list = document.getElementById('lb-list');
+          if (!list) return;
+          var board = (data && data.leaderboard) || [];
+          if (!board.length) { list.innerHTML = '<div class="empty">' + t('lb_empty') + '</div>'; return; }
+          list.innerHTML = board.map(function (r, i) {
+            return '<div class="rank-row' + (i === 0 ? ' top' : '') + '">' +
+              '<span>' + (i + 1) + '. ' + esc(r.username) + '</span>' +
+              '<span class="count">' + esc(r.presses) + '</span></div>';
+          }).join('');
+        }).catch(function () {
+          var list = document.getElementById('lb-list');
+          if (list) list.innerHTML = '<div class="empty">' + t('lb_empty') + '</div>';
+        });
+    }
+
+    function renderSettings() {
+      setScreen(
+        '<h2 class="screen-title">' + t('settings_title') + '</h2>' +
+        '<p class="screen-sub">' + t('settings_sub') + '</p>' +
+        '<div class="card">' +
+          '<div class="field"><label>' + t('settings_name') + '</label>' +
+            '<span class="value-pill" id="set-name">' + esc(me.username || '—') + '</span></div>' +
+          '<div class="field"><label>' + t('settings_lang') + '</label>' +
+            '<div class="seg" id="lang-seg">' +
+              '<button data-lang="en"' + (lang === 'en' ? ' class="active"' : '') + '>English</button>' +
+              '<button data-lang="id"' + (lang === 'id' ? ' class="active"' : '') + '>Indonesia</button>' +
+            '</div></div>' +
+          '<div class="field"><label>' + t('settings_theme') + '</label>' +
+            '<div class="seg" id="theme-seg">' +
+              '<button data-theme-val="dark"' + (theme === 'dark' ? ' class="active"' : '') + '>' + t('theme_dark') + '</button>' +
+              '<button data-theme-val="light"' + (theme === 'light' ? ' class="active"' : '') + '>' + t('theme_light') + '</button>' +
+            '</div></div>' +
+        '</div>'
+      );
+      document.getElementById('lang-seg').addEventListener('click', function (e) {
+        var b = e.target.closest('button'); if (!b) return;
+        lang = b.getAttribute('data-lang');
+        localStorage.setItem('nexa_lang', lang);
+        applyNavLabels();
+        renderSettings();
+      });
+      document.getElementById('theme-seg').addEventListener('click', function (e) {
+        var b = e.target.closest('button'); if (!b) return;
+        theme = b.getAttribute('data-theme-val');
+        localStorage.setItem('nexa_theme', theme);
+        applyTheme();
+        renderSettings();
+      });
+    }
+
+    // ----- Router ------------------------------------------------------------
+    var ROUTES = {
+      '/': renderHome,
+      '/explore': renderExplore,
+      '/check-in': renderCheckin,
+      '/leaderboard': renderLeaderboard,
+      '/settings': renderSettings
+    };
+
+    function currentPath() {
+      var p = window.location.pathname;
+      return ROUTES[p] ? p : '/';
+    }
+
+    function applyNavLabels() {
+      var links = document.querySelectorAll('#nav a[data-i18n]');
+      for (var i = 0; i < links.length; i++) {
+        links[i].textContent = t(links[i].getAttribute('data-i18n'));
+      }
+    }
+
+    function highlightNav(path) {
+      var links = document.querySelectorAll('#nav a[data-route]');
+      for (var i = 0; i < links.length; i++) {
+        var r = links[i].getAttribute('data-route');
+        if (r === path) links[i].classList.add('active');
+        else links[i].classList.remove('active');
+      }
+    }
+
+    function render() {
+      var path = currentPath();
+      highlightNav(path);
+      (ROUTES[path] || renderHome)();
+    }
+
+    function navigate(path) {
+      if (!ROUTES[path]) path = '/';
+      history.pushState({}, '', withQuery(path));
+      render();
+    }
+
+    // Intercept internal nav clicks -> pushState (keeps token, avoids reload).
+    document.getElementById('nav').addEventListener('click', function (e) {
+      var a = e.target.closest('a[data-route]');
+      if (!a) return;
+      e.preventDefault();
+      navigate(a.getAttribute('data-route'));
     });
 
-    loadLeaderboard();
+    window.addEventListener('popstate', render);
+
+    // ----- Boot --------------------------------------------------------------
+    var badge = document.getElementById('staging-badge');
+    if (badge && DEMO) badge.style.display = '';
+
+    applyNavLabels();
+
+    // Fetch the signed-in user (never DB-dependent), then render the route.
+    api('/api/me').then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) { if (data && data.user) me = data.user; })
+      .catch(function () {})
+      .then(function () { render(); });
+  })();
   </script>
 </body>
 </html>
