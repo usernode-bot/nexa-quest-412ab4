@@ -8,6 +8,10 @@ const port = process.env.PORT || 3000;
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// Staging vs production. Only ever used to SEED demo data / suppress
+// outbound side effects — never to change which features exist.
+const IS_STAGING = process.env.USERNODE_ENV === 'staging';
+
 // Paths that stay open without authentication. Add a path here (and add it
 // with `app.get`/`app.post` below) if you deliberately want it public.
 // Everything else requires a valid platform-issued JWT.
@@ -37,6 +41,38 @@ app.use((req, res, next) => {
 
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+// Seed a small, obviously-fake populated leaderboard so staging previews
+// (and the automated proposal checks, which run against a fresh empty DB)
+// always render real rows instead of the empty state. Idempotent and a
+// strict no-op outside staging.
+const DEMO_PLAYERS = [
+  { user_id: -1, username: 'Staging demo Nova', presses: 42 },
+  { user_id: -2, username: 'Staging demo Zephyr', presses: 27 },
+  { user_id: -3, username: 'Staging demo Pixel', presses: 11 },
+];
+
+async function seedStagingDemo() {
+  if (!IS_STAGING) return;
+  // Existence guard: the table has no natural unique key, so avoid
+  // re-seeding on every boot / demo request by checking for the prefix.
+  const { rowCount } = await pool.query(
+    `SELECT 1 FROM presses WHERE username LIKE 'Staging demo %' LIMIT 1`
+  );
+  if (rowCount > 0) return;
+  for (const p of DEMO_PLAYERS) {
+    const values = [];
+    const params = [];
+    for (let i = 0; i < p.presses; i++) {
+      params.push(`($${values.length + 1}, $${values.length + 2})`);
+      values.push(p.user_id, p.username);
+    }
+    await pool.query(
+      `INSERT INTO presses (user_id, username) VALUES ${params.join(', ')}`,
+      values
+    );
+  }
+}
+
 // Button press
 app.post('/api/press', async (req, res) => {
   try {
@@ -50,8 +86,13 @@ app.post('/api/press', async (req, res) => {
 });
 
 // Leaderboard
-app.get('/api/leaderboard', async (_req, res) => {
+app.get('/api/leaderboard', async (req, res) => {
   try {
+    // Request-time top-up: guarantees a populated board for `?demo=1`
+    // even if this container boot raced the check. No-op in production.
+    if (IS_STAGING && req.query.demo === '1') {
+      await seedStagingDemo();
+    }
     const { rows } = await pool.query(`
       SELECT username, COUNT(*) as presses
       FROM presses
@@ -92,6 +133,7 @@ async function start() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  await seedStagingDemo();
   app.listen(port, () => console.log(`Listening on :${port}`));
 }
 

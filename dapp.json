@@ -1,3 +1,8 @@
 {
-  "secrets": []
+  "name": "NEXA QUEST",
+  "secrets": [],
+  "tests": [
+    { "name": "Home loads", "path": "/" },
+    { "name": "Leaderboard renders", "path": "/?demo=1", "expectSelector": "#leaderboard .lb-row", "expectText": "Staging demo Nova" }
+  ]
 }

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  
+
   <script>
   // usernode-dev-console@1
   (function () {
@@ -66,6 +66,7 @@
   <title>NEXA QUEST</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script>tailwind.config = { darkMode: 'class' }</script>
+  <script src="https://social-vibecoding.usernodelabs.org/usernode-bridge/v1/bridge.js"></script>
 </head>
 <body class="bg-zinc-950 text-zinc-100 min-h-screen flex flex-col items-center justify-center gap-8 p-4">
   <h1 class="text-2xl font-bold">NEXA QUEST</h1>
@@ -84,24 +85,28 @@
   <script>
     const params = new URLSearchParams(window.location.search);
     const token = params.get('token') || '';
+    const isDemo = params.get('demo') === '1';
     const headers = token ? { 'x-usernode-token': token } : {};
 
     async function loadLeaderboard() {
-      const res = await fetch('/api/leaderboard', { headers });
-      if (!res.ok) return;
-      const { leaderboard } = await res.json();
-      const el = document.getElementById('leaderboard');
-      if (!leaderboard.length) {
-        el.innerHTML = '<p class="text-center text-zinc-600 text-sm">No presses yet</p>';
-        return;
-      }
-      el.innerHTML = leaderboard.map((r, i) =>
-        '<div class="flex justify-between px-3 py-1 rounded ' + (i === 0 ? 'bg-violet-600/20 text-violet-300' : 'text-zinc-400') + '">' +
-        '<span>' + (i + 1) + '. ' + r.username + '</span>' +
-        '<span class="font-mono">' + r.presses + '</span></div>'
-      ).join('');
-      const total = leaderboard.reduce((s, r) => s + parseInt(r.presses), 0);
-      document.getElementById('count').textContent = total + ' total presses';
+      try {
+        const res = await fetch('/api/leaderboard' + (isDemo ? '?demo=1' : ''), { headers });
+        if (!res.ok) return;
+        const { leaderboard } = await res.json();
+        const el = document.getElementById('leaderboard');
+        if (!leaderboard.length) {
+          el.innerHTML = '<p class="text-center text-zinc-600 text-sm">No presses yet</p>';
+          document.getElementById('count').textContent = '0 total presses';
+          return;
+        }
+        el.innerHTML = leaderboard.map((r, i) =>
+          '<div class="lb-row flex justify-between px-3 py-1 rounded ' + (i === 0 ? 'bg-violet-600/20 text-violet-300' : 'text-zinc-400') + '">' +
+          '<span>' + (i + 1) + '. ' + r.username + '</span>' +
+          '<span class="font-mono">' + r.presses + '</span></div>'
+        ).join('');
+        const total = leaderboard.reduce((s, r) => s + parseInt(r.presses, 10), 0);
+        document.getElementById('count').textContent = total + ' total presses';
+      } catch (_) {}
     }
 
     document.getElementById('press-btn').addEventListener('click', async () => {
@@ -112,7 +117,7 @@
         });
         if (res.ok) loadLeaderboard();
         else if (res.status === 401) document.getElementById('count').textContent = 'Sign in to press!';
-      } catch {}
+      } catch (_) {}
     });
 
     loadLeaderboard();
