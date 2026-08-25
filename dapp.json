@@ -1,4 +1,45 @@
 {
+  "name": "LIVE TRANSLATION",
   "secrets": [],
-  "name": "LIVE TRANSLATION"
+  "llm": {
+    "purpose": "Translates what people say in a call into each listener's language",
+    "suggested_daily_cap_cents": 500
+  },
+  "tests": [
+    {
+      "name": "Lobby renders",
+      "path": "/",
+      "expectText": "Start a call"
+    },
+    {
+      "name": "Language sheet opens from a deep link",
+      "path": "/?screen=languages",
+      "expectSelector": "#lang-sheet"
+    },
+    {
+      "name": "Room feed shows translated captions",
+      "path": "/room/DEMOSUP",
+      "expectSelector": "#feed .utterance .translation"
+    },
+    {
+      "name": "Non-member sees the read-only preview",
+      "path": "/room/DEMOSUP",
+      "expectText": "Translation preview"
+    },
+    {
+      "name": "Townhall groups listeners by language",
+      "path": "/room/DEMOHALL",
+      "expectSelector": "#roster .lang-group"
+    },
+    {
+      "name": "Unknown room code explains itself",
+      "path": "/room/ZZZZZZ",
+      "expectText": "Room not found"
+    },
+    {
+      "name": "Metrics screen reports latency",
+      "path": "/admin/metrics",
+      "expectText": "p95 latency"
+    }
+  ]
 }

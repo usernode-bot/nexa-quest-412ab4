@@ -1,8 +1,8 @@
 {
-  "name": "nexa-quest-412ab4",
+  "name": "live-translation-412ab4",
   "version": "1.0.0",
   "private": true,
-  "description": "NEXA QUEST",
+  "description": "LIVE TRANSLATION \u2014 cross-language live voice for UserNode Labs",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
