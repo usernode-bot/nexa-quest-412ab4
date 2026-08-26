@@ -7,9 +7,16 @@ const jwt = require('jsonwebtoken');
 const CONFIG = require('./lib/config');
 const { migrate } = require('./lib/schema');
 const { seedStaging } = require('./lib/seed');
-const translator = require('./lib/translate');
+const translator = require('./lib/engine');
+const floor = require('./lib/floor');
+const cost = require('./lib/cost');
+const langgroups = require('./lib/langgroups');
+const telephony = require('./lib/bridge/telephony');
 
-const { LANG_CODES, LANG_BY_CODE, PURPOSE_KEYS, LIMITS } = CONFIG;
+const {
+  LANG_CODES, LANG_BY_CODE, PURPOSE_KEYS, LIMITS,
+  TIER_BY_KEY, TIER_KEYS, PURPOSE_TIER,
+} = CONFIG;
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -142,11 +149,36 @@ async function rateAllows(scope, key, limit, windowSql) {
   return true;
 }
 
+// A room's tier decides its participant cap, how many people may hold the
+// floor at once, and whether the roster is sent row-by-row or aggregated.
+// Unknown values fall back to the smallest tier rather than throwing — a room
+// row written by an older deploy is still a room.
+function tierFor(room) {
+  return TIER_BY_KEY[room && room.scale_tier] || TIER_BY_KEY.direct;
+}
+
+function publicTier(tier) {
+  return {
+    key: tier.key,
+    label: tier.label,
+    blurb: tier.blurb,
+    maxParticipants: tier.maxParticipants,
+    maxTargetLangs: tier.maxTargetLangs,
+    speakerSlots: tier.speakerSlots,
+    rosterMode: tier.rosterMode,
+    handQueue: tier.handQueue,
+    pollActiveMs: tier.pollActiveMs,
+  };
+}
+
 function publicRoom(room) {
+  const tier = tierFor(room);
   return {
     code: room.code,
     title: room.title,
     purpose: room.purpose,
+    scaleTier: tier.key,
+    tier: publicTier(tier),
     hostUserId: room.host_user_id,
     hostUsername: room.host_username,
     twoWay: room.two_way,
@@ -159,6 +191,9 @@ function publicRoom(room) {
       room.active_speaker_until && new Date(room.active_speaker_until) > new Date()
         ? room.active_speaker_user_id
         : null,
+    // Multi-slot floors live in `active_speakers`; /stream fills this in. The
+    // scalar above is kept so a client mid-deploy still renders.
+    activeSpeakerUserIds: [],
   };
 }
 
@@ -186,8 +221,13 @@ app.get('/api/config', (_req, res) => {
     languages: CONFIG.LANGUAGES,
     comingSoon: CONFIG.COMING_SOON,
     purposes: CONFIG.ROOM_PURPOSES,
+    tiers: CONFIG.SCALE_TIERS,
+    tierByPurpose: PURPOSE_TIER,
+    degrade: CONFIG.DEGRADE_THRESHOLDS,
     limits: LIMITS,
     llmEnabled: translator.LLM_ENABLED,
+    engine: translator.activeEngineId(),
+    dialIn: telephony.status(),
     env: process.env.USERNODE_ENV || 'production',
   });
 });
@@ -301,6 +341,13 @@ app.post('/api/rooms', async (req, res) => {
   const twoWay = typeof (req.body && req.body.twoWay) === 'boolean'
     ? req.body.twoWay
     : !!(purposeDef && purposeDef.defaultTwoWay);
+  // Each pinned use case starts in the tier that matches how it actually runs
+  // (a townhall is a large room from the first second), but the host may pick
+  // a bigger one up front rather than upgrading mid-call.
+  const requested = req.body && req.body.scaleTier;
+  const scaleTier = TIER_KEYS.includes(requested)
+    ? requested
+    : (PURPOSE_TIER[purpose] || 'direct');
 
   try {
     if (!await rateAllows('room_create', req.user.id, LIMITS.ROOMS_PER_HOUR_PER_USER, '1 hour')) {
@@ -320,11 +367,11 @@ app.post('/api/rooms', async (req, res) => {
     for (let attempt = 0; attempt < 6 && !room; attempt += 1) {
       const code = newRoomCode();
       const { rows } = await client.query(
-        `INSERT INTO rooms (code, title, purpose, host_user_id, host_username, two_way, seq)
-         VALUES ($1,$2,$3,$4,$5,$6,1)
+        `INSERT INTO rooms (code, title, purpose, host_user_id, host_username, two_way, scale_tier, seq)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,1)
          ON CONFLICT (code) DO NOTHING
          RETURNING *`,
-        [code, title, purpose, req.user.id, req.user.username, twoWay]
+        [code, title, purpose, req.user.id, req.user.username, twoWay, scaleTier]
       );
       room = rows[0] || null;
     }
@@ -336,6 +383,10 @@ app.post('/api/rooms', async (req, res) => {
       [room.id, req.user.id, req.user.username, speaks, hears]
     );
     await client.query('COMMIT');
+    // A room is a durable address; the SITTING is what accrues cost. Opening
+    // the ledger row is best-effort — a dashboard is never worth a failed call.
+    cost.startSession(pool, room.id, scaleTier, translator.activeEngineId())
+      .catch((err) => console.error('[cost] session open failed', err.message));
     res.json({ room: publicRoom(room) });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -376,9 +427,19 @@ app.post('/api/rooms/:code/join', async (req, res) => {
          WHERE room_id = $1 AND left_at IS NULL AND removed = FALSE`,
         [room.id]
       );
-      if (counts.rows[0].n >= LIMITS.MAX_PARTICIPANTS) {
+      // Two ceilings, and the room takes the lower: the tier the host chose,
+      // and the app-wide maximum. A direct call that has quietly become a
+      // meeting is an upgrade the host makes, not something a joiner forces.
+      const tier = tierFor(room);
+      const peopleCap = Math.min(tier.maxParticipants, LIMITS.MAX_PARTICIPANTS);
+      if (counts.rows[0].n >= peopleCap) {
         await client.query('ROLLBACK');
-        return res.status(409).json({ error: 'room_full' });
+        return res.status(409).json({
+          error: 'room_full',
+          tier: tier.key,
+          max: peopleCap,
+          message: `This ${tier.label.toLowerCase()} holds ${peopleCap} people. The host can move it to a larger room.`,
+        });
       }
       const distinct = await client.query(
         `SELECT DISTINCT hears_lang FROM room_participants
@@ -386,11 +447,15 @@ app.post('/api/rooms/:code/join', async (req, res) => {
         [room.id]
       );
       const langs = new Set(distinct.rows.map((r) => r.hears_lang));
-      if (!langs.has(hears) && langs.size >= LIMITS.MAX_TARGET_LANGS) {
+      // The language cap is the one that actually bounds spend, so it is
+      // enforced here AND again as a slice in the fan-out.
+      const langCap = Math.min(tier.maxTargetLangs, LIMITS.MAX_TARGET_LANGS);
+      if (!langs.has(hears) && langs.size >= langCap) {
         await client.query('ROLLBACK');
         return res.status(409).json({
           error: 'too_many_languages',
-          message: `This call already carries ${LIMITS.MAX_TARGET_LANGS} listening languages, the maximum.`,
+          max: langCap,
+          message: `This call already carries ${langCap} listening languages, the maximum for a ${tier.label.toLowerCase()}.`,
         });
       }
     }
@@ -450,11 +515,13 @@ app.patch('/api/rooms/:code/me', async (req, res) => {
         [room.id, req.user.id]
       );
       const langs = new Set(distinct.rows.map((r) => r.hears_lang));
-      if (!langs.has(hears) && langs.size >= LIMITS.MAX_TARGET_LANGS) {
+      const langCap = Math.min(tierFor(room).maxTargetLangs, LIMITS.MAX_TARGET_LANGS);
+      if (!langs.has(hears) && langs.size >= langCap) {
         await client.query('ROLLBACK');
         return res.status(409).json({
           error: 'too_many_languages',
-          message: `This call already carries ${LIMITS.MAX_TARGET_LANGS} listening languages, the maximum.`,
+          max: langCap,
+          message: `This call already carries ${langCap} listening languages, the maximum.`,
         });
       }
     }
@@ -572,69 +639,189 @@ app.post('/api/rooms/:code/mode', async (req, res) => {
   }
 });
 
-// Stage 5 — the active-speaker lease. A conditional UPDATE is the whole
-// mechanism: whoever wins the row holds the floor until the lease lapses,
-// and a dead tab releases it without anyone having to notice.
-app.post('/api/rooms/:code/floor', async (req, res) => {
-  const release = !!(req.body && req.body.release);
-  try {
-    const room = await findRoom(req.params.code);
-    if (!room) return res.status(404).json({ error: 'room_not_found' });
-    const me = await getParticipant(room.id, req.user.id);
-    if (!me || me.removed) return res.status(403).json({ error: 'not_a_member' });
-    if (me.muted_by_host) return res.status(403).json({ error: 'muted_by_host' });
+// Host-only tier upgrade. A call that started as two people walking through
+// setup and turned into a fifteen-operator incident bridge should not have to
+// be re-created at a new code — the address people already pasted into chat
+// stays the address.
+//
+// Upgrades only, never shrinks. Going the other way would mean deciding which
+// of the people already in the room get ejected, and there is no answer to
+// that question that is not rude.
+app.post('/api/rooms/:code/tier', async (req, res) => {
+  const wanted = req.body && req.body.scaleTier;
+  if (!TIER_KEYS.includes(wanted)) return res.status(400).json({ error: 'bad_tier' });
 
-    if (release) {
-      await pool.query(
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      'SELECT * FROM rooms WHERE code = $1 FOR UPDATE',
+      [String(req.params.code || '').toUpperCase()]
+    );
+    const room = rows[0];
+    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
+    if (room.host_user_id !== req.user.id) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'host_only' });
+    }
+    if (room.ended_at) { await client.query('ROLLBACK'); return res.status(410).json({ error: 'room_ended' }); }
+
+    const current = tierFor(room);
+    // TIER_KEYS is ordered smallest to largest, so the comparison is the index.
+    if (TIER_KEYS.indexOf(wanted) < TIER_KEYS.indexOf(current.key)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'cannot_shrink_tier',
+        message: 'A room can grow mid-call but cannot shrink — nobody gets ejected.',
+        current: current.key,
+      });
+    }
+
+    const seq = await bumpSeq(client, room.id);
+    const { rows: updated } = await client.query(
+      'UPDATE rooms SET scale_tier = $2 WHERE id = $1 RETURNING *',
+      [room.id, wanted]
+    );
+    await client.query('COMMIT');
+    res.json({ ok: true, room: publicRoom(updated[0]), seq });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// The floor. Generalized from one active speaker to N slots (direct 1,
+// group 3, large 1) — see lib/floor.js. A lease is a ROW whose `until` has
+// not passed, so a speaker whose tab died stops holding the floor without
+// anyone having to notice.
+app.post('/api/rooms/:code/floor', async (req, res) => {
+  const wantsRelease = !!(req.body && req.body.release);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: roomRows } = await client.query(
+      'SELECT * FROM rooms WHERE code = $1 FOR UPDATE',
+      [String(req.params.code || '').toUpperCase()]
+    );
+    const room = roomRows[0];
+    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
+
+    const { rows: meRows } = await client.query(
+      'SELECT * FROM room_participants WHERE room_id = $1 AND user_id = $2',
+      [room.id, req.user.id]
+    );
+    const me = meRows[0];
+    if (!me || me.removed) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'not_a_member' }); }
+    if (me.muted_by_host) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'muted_by_host' }); }
+
+    if (wantsRelease) {
+      await floor.release(client, room.id, req.user.id);
+      await client.query(
         `UPDATE rooms SET active_speaker_user_id = NULL, active_speaker_until = NULL
          WHERE id = $1 AND active_speaker_user_id = $2`,
         [room.id, req.user.id]
       );
-      return res.json({ ok: true, holder: null });
+      const holders = await floor.activeSpeakers(client, room.id);
+      await client.query('COMMIT');
+      return res.json({ ok: true, holder: null, activeSpeakers: holders });
     }
 
-    const { rows } = await pool.query(
-      `UPDATE rooms
-       SET active_speaker_user_id = $2,
-           active_speaker_until = NOW() + ($3 || ' milliseconds')::INTERVAL
-       WHERE id = $1
-         AND (active_speaker_user_id IS NULL
-              OR active_speaker_user_id = $2
-              OR active_speaker_until < NOW())
-       RETURNING active_speaker_user_id`,
-      [room.id, req.user.id, LIMITS.FLOOR_LEASE_MS]
-    );
-    if (!rows.length) {
-      const current = await findRoom(req.params.code);
+    const tier = tierFor(room);
+    const result = await floor.claim(client, room.id, req.user, tier);
+    if (!result.granted) {
+      // Their hand went up as part of the claim, so the room state changed.
+      const seq = await bumpSeq(client, room.id);
+      await client.query('COMMIT');
       return res.status(409).json({
         error: 'floor_taken',
-        holder: current ? current.active_speaker_user_id : null,
+        queued: true,
+        position: result.position,
+        slots: tier.speakerSlots,
+        holder: result.holders.length ? result.holders[0].userId : null,
+        holders: result.holders,
+        seq,
       });
     }
-    res.json({ ok: true, holder: req.user.id });
+
+    // Keep the legacy scalar in step for the single-slot tiers, so a client
+    // that has not reloaded across this deploy still shows a speaker.
+    if (tier.speakerSlots === 1) {
+      await client.query(
+        `UPDATE rooms SET active_speaker_user_id = $2, active_speaker_until = $3 WHERE id = $1`,
+        [room.id, req.user.id, result.until]
+      );
+    }
+    // A renewal is not news; only a fresh claim moves the room's cursor.
+    let seq = Number(room.seq);
+    if (!result.renewed) seq = await bumpSeq(client, room.id);
+    const holders = await floor.activeSpeakers(client, room.id);
+    await client.query('COMMIT');
+    res.json({ ok: true, holder: req.user.id, until: result.until, activeSpeakers: holders, seq });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Dial-in. Answers 501 in EVERY environment, because the capability is
+// missing from the platform rather than from this deploy — see
+// lib/bridge/telephony.js. The room UI shows the row as "coming soon" rather
+// than hiding it, so the roadmap is visible and the honest answer is one tap
+// away instead of being a surprise.
+app.post('/api/rooms/:code/dial-in', async (req, res) => {
+  try {
+    const room = await findRoom(req.params.code);
+    if (!room) return res.status(404).json({ error: 'room_not_found' });
+    const result = await telephony.requestDialIn(room);
+    res.status(501).json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
 // --- utterances ------------------------------------------------------------
-async function fanOutTranslations(room, utterance, userToken) {
+// Fan-out: one translation call per LANGUAGE GROUP, not per listener.
+//
+// This is the whole cost argument. Sixty Indonesian listeners in a townhall
+// are one call, not sixty, so the bill tracks G (distinct target languages)
+// while the audience tracks N. Three bounds hold it down, and all three are
+// structural rather than hopeful: the tier's language cap, the global
+// MAX_TARGET_LANGS slice, and the degradation ladder in lib/cost.js.
+async function fanOutTranslations(room, utterance, userToken, opts) {
+  const options = opts || {};
+  const tier = tierFor(room);
+  const degrade = cost.level(room.id);
+  const engineId = translator.activeEngineId();
+
   let targets = [];
+  let groups = [];
   try {
-    const { rows } = await pool.query(
-      `SELECT DISTINCT hears_lang FROM room_participants
-       WHERE room_id = $1 AND left_at IS NULL AND removed = FALSE`,
-      [room.id]
-    );
-    targets = rows.map((r) => r.hears_lang).filter((l) => l && l !== utterance.source_lang);
+    groups = await langgroups.languageGroups(pool, room.id);
+    targets = langgroups.resolveTargets(groups, utterance.source_lang, tier, degrade, {
+      speakerHoldsFloor: !!options.speakerHoldsFloor,
+    });
   } catch (err) {
     console.error('[translate] could not resolve targets:', err.message);
     return;
   }
-  // Hard cap regardless of what the roster says — this is what bounds spend.
-  targets = targets.slice(0, LIMITS.MAX_TARGET_LANGS);
 
-  for (const target of targets) {
+  const sizeOf = Object.fromEntries(groups.map((g) => [g.lang, g.size]));
+
+  if (!targets.length && degrade !== 'normal') {
+    // Degrading is not silence: the transcript still flows, and the room is
+    // told why the captions stopped rather than being left to guess.
+    console.log(`[translate] room=${room.id} tier=${tier.key} src=${utterance.source_lang} `
+      + `groups=${groups.length} status=shed code=${degrade}`);
+  }
+
+  for (const group of targets) {
+    const target = group.lang;
+    const groupSize = sizeOf[target] || 1;
+
     // Insert the pending row first so listeners see "translating…" rather
     // than a caption that appears out of nowhere a second later.
     let placed = false;
@@ -644,10 +831,11 @@ async function fanOutTranslations(room, utterance, userToken) {
         await client.query('BEGIN');
         const seq = await bumpSeq(client, room.id);
         const ins = await client.query(
-          `INSERT INTO utterance_translations (utterance_id, room_id, target_lang, status, seq)
-           VALUES ($1,$2,$3,'pending',$4)
+          `INSERT INTO utterance_translations
+             (utterance_id, room_id, target_lang, status, seq, group_size, engine_id)
+           VALUES ($1,$2,$3,'pending',$4,$5,$6)
            ON CONFLICT (utterance_id, target_lang) DO NOTHING`,
-          [utterance.id, room.id, target, seq]
+          [utterance.id, room.id, target, seq, groupSize, engineId]
         );
         await client.query('COMMIT');
         placed = ins.rowCount > 0;
@@ -663,6 +851,9 @@ async function fanOutTranslations(room, utterance, userToken) {
     }
     if (!placed) continue;
 
+    // EVERY fan-out path goes through enqueue(): serial per (room, target) so
+    // a listener's captions arrive in the order they were spoken, and shed
+    // rather than queued without bound when the proxy falls behind.
     translator.enqueue(room.id, target, async () => {
       const result = await translator.translate({
         roomId: room.id,
@@ -670,17 +861,38 @@ async function fanOutTranslations(room, utterance, userToken) {
         targetLang: target,
         sourceText: utterance.source_text,
         userToken,
+        // Delta captions: a provisional caption is written as the model
+        // writes, so a listener starts reading before the sentence is done.
+        onPartial: (partial) => {
+          writePartial(room.id, utterance.id, target, partial).catch(() => {});
+        },
       });
+
+      const deltaCents = cost.noteMeter(room.id, utterance.speaker_user_id, result.meter);
+      cost.noteTranslation(pool, room.id, deltaCents, cost.level(room.id))
+        .catch(() => {});
+
       try {
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
+          // A speaker who retracted mid-flight does not get their words
+          // published a second later by a call that was already in the air.
+          const { rows: live } = await client.query(
+            'SELECT retracted FROM utterances WHERE id = $1',
+            [utterance.id]
+          );
+          const retracted = !live.length || live[0].retracted;
           const seq = await bumpSeq(client, room.id);
           await client.query(
             `UPDATE utterance_translations
-             SET text=$3, status=$4, latency_ms=$5, seq=$6
+             SET text=$3, status=$4, latency_ms=$5, ttft_ms=$6, seq=$7,
+                 group_size=$8, engine_id=$9
              WHERE utterance_id=$1 AND target_lang=$2`,
-            [utterance.id, target, result.text, result.status, result.latencyMs, seq]
+            [utterance.id, target,
+              retracted ? null : result.text,
+              retracted ? 'retracted' : result.status,
+              result.latencyMs, result.ttftMs, seq, groupSize, engineId]
           );
           await client.query('COMMIT');
         } catch (e) {
@@ -692,8 +904,41 @@ async function fanOutTranslations(room, utterance, userToken) {
       } catch (err) {
         console.error('[translate] result write failed:', err.message);
       }
+
+      // One structured line per call, with no utterance content in it — this
+      // is the monitoring surface, not a transcript log.
+      console.log(`[translate] room=${room.id} tier=${tier.key} src=${utterance.source_lang} `
+        + `tgt=${target} group=${groupSize} status=${result.status} `
+        + `ttft=${result.ttftMs == null ? '-' : result.ttftMs} `
+        + `lat=${result.latencyMs == null ? '-' : result.latencyMs} `
+        + `code=${result.code || '-'} degrade=${degrade}`);
+
       return result;
     });
+  }
+}
+
+// A partial caption is a provisional row: same row, `status='partial'`, a new
+// seq so the cursor stream carries it. The client renders it dimmed and
+// deliberately never SPEAKS it — hearing half a sentence read aloud and then
+// the whole sentence again is worse than waiting.
+async function writePartial(roomId, utteranceId, target, text) {
+  if (!text) return;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const seq = await bumpSeq(client, roomId);
+    await client.query(
+      `UPDATE utterance_translations
+          SET text = $3, status = 'partial', seq = $4
+        WHERE utterance_id = $1 AND target_lang = $2 AND status IN ('pending','partial')`,
+      [utteranceId, target, text, seq]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+  } finally {
+    client.release();
   }
 }
 
@@ -747,12 +992,15 @@ app.post('/api/rooms/:code/utterances', async (req, res) => {
       client.release();
     }
 
-    // Transcript-only mode (Stage 7 fallback) still records what was said —
-    // it just does not spend anyone's AI budget translating it.
+    cost.noteUtterance(pool, room.id).catch(() => {});
+
+    // Transcript-only mode (the host's escape hatch, and the bottom rung of
+    // the budget ladder) still records what was said — it just does not spend
+    // anyone's AI budget translating it.
     if (room.mode !== 'transcript_only') {
-      fanOutTranslations(room, utterance, req.userToken).catch((err) =>
-        console.error('[translate] fan-out failed:', err.message)
-      );
+      const holdsFloor = await floor.holdsFloor(pool, room.id, req.user.id).catch(() => false);
+      fanOutTranslations(room, utterance, req.userToken, { speakerHoldsFloor: holdsFloor })
+        .catch((err) => console.error('[translate] fan-out failed:', err.message));
     }
 
     res.json({ utterance: { id: Number(utterance.id), seq: Number(utterance.seq) } });
@@ -853,11 +1101,21 @@ app.get('/api/rooms/:code/stream', async (req, res) => {
     // read-only, and it behaves identically in production.
     const hears = me ? me.hears_lang : null;
 
+    const tier = tierFor(room);
+    // A large room's roster is not something a poll can carry row by row, and
+    // it is not what the room needs to show either: "three languages, 61 / 74
+    // / 65 people" is the useful shape. Small rooms still send every row,
+    // because there you want to see faces and hands.
+    const aggregated = tier.rosterMode === 'aggregate';
+    const rosterLimit = aggregated ? 0 : Math.min(tier.maxParticipants, 200);
+
     const [participants, utterances, translations] = await Promise.all([
-      pool.query(
-        `SELECT * FROM room_participants WHERE room_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT 200`,
-        [room.id, since]
-      ),
+      rosterLimit
+        ? pool.query(
+          `SELECT * FROM room_participants WHERE room_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3`,
+          [room.id, since, rosterLimit]
+        )
+        : Promise.resolve({ rows: [] }),
       pool.query(
         `SELECT * FROM utterances WHERE room_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT 200`,
         [room.id, since]
@@ -888,6 +1146,32 @@ app.get('/api/rooms/:code/stream', async (req, res) => {
       backlog = { utterances: u.rows, translations: t.rows };
     }
 
+    // Always sent, at every tier — one cheap GROUP BY, and it is what the
+    // aggregate roster, the invariant check and the "who can hear me" line in
+    // the composer are all built out of.
+    const [groups, statuses, holders, queue, counts] = await Promise.all([
+      langgroups.languageGroups(pool, room.id),
+      langgroups.groupStatuses(pool, room.id),
+      floor.activeSpeakers(pool, room.id),
+      tier.handQueue ? floor.queueFor(pool, room.id, 20) : Promise.resolve([]),
+      pool.query(
+        `SELECT COUNT(*)::int AS n FROM room_participants
+          WHERE room_id = $1 AND left_at IS NULL AND removed = FALSE`,
+        [room.id]
+      ),
+    ]);
+
+    const langGroups = groups.map((g) => ({
+      lang: g.lang,
+      size: g.size,
+      speaking: g.speaking,
+      hands: g.hands,
+      // 'off' is the room's own choice, not a failure — say so differently.
+      status: room.mode === 'transcript_only' ? 'off' : (statuses[g.lang] || 'idle'),
+    }));
+
+    const myQueuePosition = queue.findIndex((q) => q.userId === req.user.id) + 1 || null;
+
     const mergeById = (a, b) => {
       const seen = new Map();
       for (const row of [...a, ...b]) seen.set(String(row.id), row);
@@ -905,12 +1189,26 @@ app.get('/api/rooms/:code/stream', async (req, res) => {
       byUtterance.get(key).push(t);
     }
 
+    const roomOut = publicRoom(room);
+    roomOut.activeSpeakerUserIds = holders.map((h) => h.userId);
+
     res.json({
-      room: publicRoom(room),
+      room: roomOut,
       me: me ? publicParticipant(me) : null,
       isMember,
       hearsLang: hears,
       seq: Number(room.seq),
+      tier: publicTier(tier),
+      rosterMode: tier.rosterMode,
+      participantCount: counts.rows[0].n,
+      langGroups,
+      activeSpeakers: holders,
+      queue,
+      myQueuePosition,
+      // The host sees a percentage and a rung, never a dollar figure — the
+      // meter belongs to the speaker's own platform budget, not to this app.
+      budget: room.host_user_id === req.user.id ? cost.budgetFor(room.id) : null,
+      dialIn: telephony.status(),
       participants: participants.rows.map(publicParticipant),
       utterances: allUtterances.map((u) => ({
         id: Number(u.id),
@@ -927,6 +1225,8 @@ app.get('/api/rooms/:code/stream', async (req, res) => {
           text: u.retracted ? null : t.text,
           status: t.status,
           latencyMs: t.latency_ms,
+          ttftMs: t.ttft_ms,
+          groupSize: t.group_size,
         })),
       })),
     });
@@ -958,14 +1258,19 @@ app.post('/api/rooms/:code/leave', async (req, res) => {
        WHERE id = $1 AND active_speaker_user_id = $2`,
       [room.id, req.user.id]
     );
+    await floor.release(client, room.id, req.user.id);
     if (endRoom && room.host_user_id === req.user.id && !room.ended_at) {
+      await floor.releaseAll(client, room.id);
       await client.query(
         `UPDATE rooms SET ended_at = NOW(), end_reason = 'host_ended' WHERE id = $1`,
         [room.id]
       );
     }
     await client.query('COMMIT');
-    translator.forgetRoom(room.id);
+    if (endRoom && room.host_user_id === req.user.id) {
+      translator.forgetRoom(room.id);
+      cost.endSession(pool, room.id).catch(() => {});
+    }
     res.json({ ok: true });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -998,14 +1303,17 @@ app.get('/api/rooms/:code/summary', async (req, res) => {
 // --- metrics (Stage 7) -----------------------------------------------------
 app.get('/api/metrics', async (req, res) => {
   try {
-    const [latency, rollups, grants, live] = await Promise.all([
+    const [latency, rollups, grants, live, byTier, spend, degraded] = await Promise.all([
       pool.query(
         `SELECT
            COUNT(*)::int AS n,
            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY latency_ms))::int AS p50,
            ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms))::int AS p95,
+           ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ttft_ms))::int AS ttft_p50,
+           ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ttft_ms))::int AS ttft_p95,
            COUNT(*) FILTER (WHERE status = 'error')::int AS errors,
-           COUNT(*) FILTER (WHERE status = 'unavailable')::int AS unavailable
+           COUNT(*) FILTER (WHERE status = 'unavailable')::int AS unavailable,
+           ROUND(AVG(group_size), 1)::float AS avg_group_size
          FROM utterance_translations
          WHERE created_at > NOW() - INTERVAL '7 days'`
       ),
@@ -1020,6 +1328,36 @@ app.get('/api/metrics', async (req, res) => {
                  WHERE left_at IS NULL AND removed = FALSE) AS live_participants
          FROM rooms WHERE ended_at IS NULL`
       ),
+      // Latency is not one number: a townhall fanning out to four languages
+      // and a two-person support call are different workloads, and averaging
+      // them together hides whichever one is sick.
+      pool.query(
+        `SELECT r.scale_tier AS tier,
+                COUNT(t.*)::int AS n,
+                ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.latency_ms))::int AS p50,
+                ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY t.latency_ms))::int AS p95
+           FROM utterance_translations t
+           JOIN rooms r ON r.id = t.room_id
+          WHERE t.created_at > NOW() - INTERVAL '7 days' AND t.status = 'ok'
+          GROUP BY r.scale_tier
+          ORDER BY COUNT(t.*) DESC`
+      ),
+      // Cost per call, read off the proxy's own meter rather than a token
+      // price table this app would only get wrong.
+      pool.query(
+        `SELECT COALESCE(SUM(spent_cents), 0)::float AS spent_cents,
+                COALESCE(SUM(translation_calls), 0)::int AS calls,
+                COALESCE(SUM(utterances), 0)::int AS utterances,
+                COUNT(*)::int AS sessions
+           FROM room_sessions
+          WHERE started_at > NOW() - INTERVAL '7 days'`
+      ),
+      pool.query(
+        `SELECT degraded_to, COUNT(*)::int AS n
+           FROM room_sessions
+          WHERE started_at > NOW() - INTERVAL '7 days' AND degraded_to IS NOT NULL
+          GROUP BY degraded_to`
+      ),
     ]);
     const grantMap = Object.fromEntries(grants.rows.map((r) => [r.outcome, r.n]));
     const asked = (grantMap.granted || 0) + (grantMap.declined || 0) + (grantMap.dismissed || 0);
@@ -1033,6 +1371,22 @@ app.get('/api/metrics', async (req, res) => {
         acceptanceRate: asked ? Math.round(((grantMap.granted || 0) / asked) * 100) : null,
       },
       live: live.rows[0],
+      byTier: byTier.rows,
+      cost: {
+        spentCents: spend.rows[0].spent_cents,
+        calls: spend.rows[0].calls,
+        utterances: spend.rows[0].utterances,
+        sessions: spend.rows[0].sessions,
+        // Cost per LISTENER is this divided by the average group size — which
+        // is the entire argument for grouping, stated as a number.
+        centsPerCall: spend.rows[0].calls
+          ? Math.round((spend.rows[0].spent_cents / spend.rows[0].calls) * 10000) / 10000
+          : null,
+      },
+      degraded: Object.fromEntries(degraded.rows.map((r) => [r.degraded_to, r.n])),
+      engines: translator.engineStatus(),
+      engine: translator.activeEngineId(),
+      dialIn: telephony.status(),
       llmEnabled: translator.LLM_ENABLED,
     });
   } catch (err) {
@@ -1074,6 +1428,9 @@ async function houseKeeping() {
       [LIMITS.RETENTION_HOURS]
     );
     await pool.query(`DELETE FROM rate_events WHERE created_at < NOW() - INTERVAL '2 hours'`);
+    // Lapsed floor leases. Claiming already reaps, but a room that went quiet
+    // should not keep showing a speaker who left an hour ago.
+    await pool.query(`DELETE FROM active_speakers WHERE until <= NOW() - INTERVAL '5 minutes'`);
     // Close rooms nobody is in any more.
     await pool.query(
       `UPDATE rooms SET ended_at = NOW(), end_reason = 'abandoned'
@@ -1083,6 +1440,12 @@ async function houseKeeping() {
            SELECT 1 FROM room_participants p
            WHERE p.room_id = rooms.id AND p.left_at IS NULL
              AND p.last_seen_at > NOW() - INTERVAL '15 minutes')`
+    );
+    // A sitting ends when its room does, even if nobody was around to say so.
+    await pool.query(
+      `UPDATE room_sessions s SET ended_at = COALESCE(r.ended_at, NOW())
+         FROM rooms r
+        WHERE r.id = s.room_id AND s.ended_at IS NULL AND r.ended_at IS NOT NULL`
     );
     // Daily rollup — aggregate only, no identity.
     await pool.query(
