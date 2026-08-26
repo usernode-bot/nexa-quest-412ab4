@@ -40,6 +40,31 @@
       "name": "Metrics screen reports latency",
       "path": "/admin/metrics",
       "expectText": "p95 latency"
+    },
+    {
+      "name": "Group room shows the floor slots",
+      "path": "/room/DEMOTEAM",
+      "expectSelector": "#speaker-slots"
+    },
+    {
+      "name": "Large room roster is aggregated",
+      "path": "/room/DEMOHALL",
+      "expectText": "Large room"
+    },
+    {
+      "name": "Partial caption renders as provisional",
+      "path": "/room/DEMOTEAM",
+      "expectSelector": "#feed .utterance .translation.partial"
+    },
+    {
+      "name": "Metrics reports engine and cost",
+      "path": "/admin/metrics",
+      "expectText": "Cost per call"
+    },
+    {
+      "name": "Dial-in is announced but disabled",
+      "path": "/room/DEMOSUP",
+      "expectText": "Join by phone — coming soon"
     }
   ]
 }

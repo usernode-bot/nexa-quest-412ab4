@@ -77,7 +77,30 @@
     metrics: null,
     summary: null,
     error: null,
+    // Stage 2 architecture — everything tier-shaped arrives on /stream.
+    tier: null,
+    rosterMode: 'full',
+    participantCount: 0,
+    langGroups: [],
+    activeSpeakers: [],
+    queue: [],
+    myQueuePosition: null,
+    budget: null,
+    dialIn: null,
+    // A tab that was hidden comes back to a backlog. Reading four minutes of
+    // captions aloud at once is noise, not translation.
+    suppressTts: false,
   };
+
+  // The room's tier, with a shape that is safe to read before the first poll
+  // lands. The server is the authority; this only keeps the first paint sane.
+  const tierOf = () =>
+    S.tier ||
+    ((S.config && S.config.tiers) || [])[0] ||
+    {
+      key: 'direct', label: 'Direct call', speakerSlots: 1, rosterMode: 'full',
+      handQueue: false, maxParticipants: 4, maxTargetLangs: 2, pollActiveMs: 900,
+    };
 
   const langOf = (code) =>
     (S.config && S.config.languages.find((l) => l.code === code)) ||
@@ -571,6 +594,12 @@
     } else if (tr && tr.status === 'ok') {
       translationBlock = `<p class="translation text-sm text-zinc-100">${esc(tr.text)}</p>
         ${tr.latencyMs != null ? `<p class="text-[11px] text-zinc-700 mt-1">${tr.latencyMs} ms</p>` : ''}`;
+    } else if (tr && tr.status === 'partial') {
+      // The caption is still being generated. Shown dim and provisional, and
+      // deliberately NEVER spoken — half a sentence read aloud, then the same
+      // sentence again in full, is worse than a moment of silence.
+      translationBlock = `<p class="translation partial text-sm text-zinc-400 italic">${esc(tr.text || '')}<span class="text-zinc-600">…</span></p>
+        <p class="text-[11px] text-zinc-700 mt-1">Still coming through — not read aloud until it is finished.</p>`;
     } else if (tr && tr.status === 'pending') {
       translationBlock = `<p class="translation text-sm text-zinc-500 animate-pulse">Translating into ${esc(langOf(target).label)}…</p>`;
     } else if (tr && tr.status === 'unavailable') {
@@ -600,7 +629,77 @@
       </article>`;
   }
 
+  // Who holds the floor right now, and how many slots there are to hold. A
+  // direct call has one; a group meeting has three; a large room has one and a
+  // queue behind it. Rendered at every tier, and for non-members too — "can I
+  // speak right now" is the first thing anyone opening a room wants to know.
+  function floorHTML() {
+    const tier = tierOf();
+    const slots = tier.speakerSlots || 1;
+    const holders = S.activeSpeakers || [];
+    const waiting = (S.queue || []).length;
+    const names = holders.map((h) => h.username).join(', ');
+    return `
+      <div id="speaker-slots" data-tier="${esc(tier.key)}" data-slots="${slots}" data-held="${holders.length}"
+           class="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-900 text-xs">
+        <span class="shrink-0 px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400" title="${esc(tier.blurb || '')}">${esc(tier.label)}</span>
+        <span class="text-zinc-500 shrink-0">Floor</span>
+        <span class="font-mono shrink-0 ${holders.length ? 'text-emerald-400' : 'text-zinc-600'}">${holders.length}/${slots}</span>
+        <span class="min-w-0 flex-1 truncate ${holders.length ? 'text-zinc-300' : 'text-zinc-600'}">${
+          holders.length ? `${esc(names)} speaking` : 'open — nobody is speaking'
+        }</span>
+        ${tier.handQueue && waiting
+          ? `<span class="shrink-0 text-amber-400">✋ ${waiting} waiting</span>`
+          : ''}
+      </div>`;
+  }
+
+  // The dial-in leg does not exist yet and says so, in every environment. A
+  // capability that only appeared in staging would be worse than none.
+  function dialInHTML() {
+    const d = S.dialIn || (S.config && S.config.dialIn);
+    if (!d) return '';
+    return `
+      <div id="dial-in" class="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-900/60 text-xs text-zinc-500">
+        <span aria-hidden="true">☎️</span>
+        <span class="min-w-0 flex-1">${esc(d.label)} — ${esc(d.note)}</span>
+        <button id="dial-in-why" class="un-touch-target text-[11px] text-zinc-600 underline">why</button>
+      </div>`;
+  }
+
+  // A large room's roster is a shape, not a list: nobody scrolls two hundred
+  // names, and the poll should not carry them. The server sends language
+  // groups instead, and this renders the same .lang-group sections the full
+  // roster does so everything downstream (including the invariant) still works.
+  function aggregateRosterHTML() {
+    const groups = S.langGroups || [];
+    const total = S.participantCount || 0;
+    if (!groups.length) {
+      return `<div id="roster" class="space-y-2"><p class="text-sm text-zinc-600">Nobody in the room yet.</p></div>`;
+    }
+    const statusLabel = {
+      ok: 'captions flowing', pending: 'translating…', partial: 'translating…',
+      unavailable: 'no translation here', error: 'translation failing', off: 'transcript only', idle: 'quiet',
+    };
+    return `<div id="roster" class="space-y-3">
+      <h3 class="text-xs uppercase tracking-wide text-zinc-500">${total} in the room · ${groups.length} languages</h3>
+      ${groups.map((g) => `
+        <section class="lang-group flex items-center gap-3 px-3 py-2.5 rounded-lg bg-zinc-900" data-lang="${esc(g.lang)}">
+          <span class="shrink-0">${langOf(g.lang).flag}</span>
+          <span class="min-w-0 flex-1 truncate text-sm">${esc(langOf(g.lang).label)}</span>
+          ${g.hands ? `<span class="text-[11px] text-amber-400">✋ ${g.hands}</span>` : ''}
+          <span class="text-[11px] text-zinc-600">${esc(statusLabel[g.status] || g.status)}</span>
+          <span class="text-sm font-mono text-zinc-400">${g.size}</span>
+        </section>`).join('')}
+      <p class="text-[11px] text-zinc-700">
+        A room this size is billed per language, not per person — these ${groups.length} groups cost
+        ${groups.length} translations per sentence, however many people are listening.
+      </p>
+    </div>`;
+  }
+
   function rosterHTML() {
+    if (tierOf().rosterMode === 'aggregate' || S.rosterMode === 'aggregate') return aggregateRosterHTML();
     const people = Array.from(S.participants.values()).filter((p) => !p.left && !p.removed);
     const groups = new Map();
     for (const p of people) {
@@ -667,6 +766,7 @@
       return `
         <div class="p-3 rounded-xl bg-zinc-900 space-y-2">
           <p class="text-sm text-zinc-400">This is a one-way call — the host and agents speak, you listen in ${esc(langOf(S.hearsLang).label)}.</p>
+          ${raised && S.myQueuePosition ? `<p id="queue-status" class="text-xs text-amber-300">✋ Number ${S.myQueuePosition} in the queue.</p>` : ''}
           <button id="raise-hand" class="un-pressable w-full py-2.5 rounded-lg ${raised ? 'bg-amber-500/20 text-amber-300' : 'bg-zinc-800 text-zinc-200'} text-sm font-medium">
             ${raised ? '✋ Hand raised — waiting for the host' : '✋ Raise your hand'}
           </button>
@@ -674,8 +774,16 @@
     }
 
     const listening = Speech.wantListening;
+    const tier = tierOf();
+    // In a tier with a queue, a refused floor claim is not an error — it is a
+    // position. The server puts your hand up for you when it refuses, so this
+    // line is a database fact rather than a guess.
+    const queueLine = tier.handQueue && S.myQueuePosition
+      ? `<p id="queue-status" class="text-xs text-amber-300 px-1">✋ You are number ${S.myQueuePosition} in the queue — you will be able to speak when a slot opens.</p>`
+      : '';
     return `
       <div class="space-y-2">
+        ${queueLine}
         <p id="mic-error" class="hidden text-xs text-amber-400"></p>
         <p id="interim" class="hidden text-sm text-zinc-500 italic px-1"></p>
         <div class="h-1 rounded-full bg-zinc-800 overflow-hidden">
@@ -698,6 +806,23 @@
       </div>`;
   }
 
+  // Shown to the host only, and as a rung plus a percentage — never a dollar
+  // figure. The meter belongs to the speaker's own platform AI budget; this
+  // app reads it off the proxy's response headers and never prices a token.
+  function budgetNoticeHTML() {
+    const b = S.budget;
+    if (!b || !b.level || b.level === 'normal') return '';
+    const copy = {
+      shed_small: 'Nearing the daily AI budget — only the largest language group is being translated for now.',
+      floor_only: 'Close to the daily AI budget — only what the floor-holders say is being translated.',
+      transcript_only: 'The daily AI budget is spent — the call is running transcript-only until it resets.',
+    };
+    return `<div id="budget-notice" data-level="${esc(b.level)}" class="p-2.5 rounded-lg bg-amber-500/10 text-amber-300 text-xs">
+      ${esc(copy[b.level] || 'Translation is degraded to stay inside the daily AI budget.')}
+      ${b.spentPct != null ? `<span class="text-amber-400/60">(${b.spentPct}% of cap)</span>` : ''}
+    </div>`;
+  }
+
   function renderRoom() {
     const room = S.room;
     if (!room) return;
@@ -713,7 +838,7 @@
     appEl().innerHTML = `
       ${header(room.title, {
         back: '/',
-        subtitle: `${purposeDef ? `${purposeDef.icon} ${purposeDef.label} · ` : ''}${room.code}`,
+        subtitle: `${purposeDef ? `${purposeDef.icon} ${purposeDef.label} · ` : ''}${room.code} · ${tierOf().label}`,
         right: `<button id="open-langs" class="un-touch-target text-xs px-2 py-1 rounded-full bg-zinc-800">${langOf(S.prefs.speaksLang).flag}→${langOf(S.hearsLang).flag}</button>`,
       })}
       <main class="max-w-2xl mx-auto px-4 py-4 space-y-4"
@@ -723,6 +848,9 @@
         ${room.endedAt ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">This call has ended.</div>` : ''}
         ${room.mode === 'transcript_only' ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-300 text-xs">Transcript-only mode: everything is captured in the original language, nothing is translated.</div>` : ''}
         ${S.config && !S.config.llmEnabled ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">Live translation is unavailable in this environment — captions show the original language.</div>` : ''}
+        ${budgetNoticeHTML()}
+
+        ${floorHTML()}
 
         <div id="feed" class="space-y-2 max-h-[52vh] overflow-y-auto pr-1">
           ${utterances.length
@@ -743,6 +871,8 @@
 
         ${rosterHTML()}
 
+        ${dialInHTML()}
+
         <div class="pt-2 text-center">
           <p class="text-[11px] text-zinc-700">Share this call: code <span class="font-mono text-zinc-500">${esc(room.code)}</span></p>
         </div>
@@ -759,6 +889,22 @@
     const el = (id) => document.getElementById(id);
 
     if (el('open-langs')) el('open-langs').addEventListener('click', openLanguageSheet);
+
+    if (el('dial-in-why')) {
+      el('dial-in-why').addEventListener('click', async () => {
+        const d = S.dialIn || (S.config && S.config.dialIn) || {};
+        // Hit the real endpoint rather than describing it: the 501 and its
+        // reason are the product surface, and they answer identically in
+        // staging and production.
+        let reason = d.reason || 'Not available yet.';
+        try {
+          await api(`/api/rooms/${code}/dial-in`, { method: 'POST', body: {} });
+        } catch (err) {
+          reason = (err.data && err.data.reason) || err.message || reason;
+        }
+        notify(reason);
+      });
+    }
 
     if (el('join-room')) {
       el('join-room').addEventListener('click', async (e) => {
@@ -911,8 +1057,24 @@
       return true;
     } catch (err) {
       if (err.code === 'floor_taken') {
-        const holder = S.participants.get(err.data && err.data.holder);
-        setMicError(`${holder ? holder.username : 'Someone else'} has the floor right now.`);
+        const d = err.data || {};
+        // The server raised our hand when it refused, so we have a position,
+        // not just a rejection. Reflect it immediately rather than waiting a
+        // poll for the composer to catch up.
+        if (d.position) S.myQueuePosition = d.position;
+        const names = (d.holders || [])
+          .map((h) => h.username)
+          .filter(Boolean);
+        const holder = S.participants.get(d.holder);
+        const who = names.length
+          ? names.join(' and ')
+          : (holder ? holder.username : 'Someone else');
+        setMicError(
+          d.position
+            ? `${who} ${names.length > 1 ? 'have' : 'has'} the floor — your hand is up, you are number ${d.position}.`
+            : `${who} ${names.length > 1 ? 'have' : 'has'} the floor right now.`
+        );
+        if (S.room) renderRoom();
         return false;
       }
       // A lease we could not renew is not a reason to drop what was said.
@@ -979,6 +1141,15 @@
       S.me = data.me;
       S.isMember = data.isMember;
       S.hearsLang = data.hearsLang || S.prefs.hearsLang;
+      S.tier = data.tier || S.tier;
+      S.rosterMode = data.rosterMode || 'full';
+      S.participantCount = data.participantCount || 0;
+      S.langGroups = data.langGroups || [];
+      S.activeSpeakers = data.activeSpeakers || [];
+      S.queue = data.queue || [];
+      S.myQueuePosition = data.myQueuePosition || null;
+      S.budget = data.budget || null;
+      S.dialIn = data.dialIn || S.dialIn;
       S.connected = true;
       S.error = null;
 
@@ -1012,17 +1183,24 @@
       // Play new captions out loud. Stage 3 (one-way rooms) restricts this to
       // the people who actually hold the floor; Stage 4 (two-way) plays
       // everyone. Never play our own words back at ourselves.
-      if (S.prefs.ttsEnabled && S.room && !S.room.endedAt) {
+      if (S.room && !S.room.endedAt) {
         for (const u of fresh) {
           if (S.spokenIds.has(u.id)) continue;
+          // Marked spoken even when we stay silent, so a caption that was
+          // already on screen while the tab was hidden is never read out
+          // minutes late when the tab comes back.
           S.spokenIds.add(u.id);
+          if (!S.prefs.ttsEnabled || S.suppressTts) continue;
           if (S.me && u.speakerUserId === S.me.userId) continue;
           const speaker = S.participants.get(u.speakerUserId);
           if (!S.room.twoWay && speaker && speaker.role === 'audience') continue;
           const tr = (u.translations || []).find((t) => t.targetLang === S.hearsLang);
+          // Only a FINISHED caption is spoken. A partial is provisional text
+          // that is about to be replaced — see utteranceHTML.
           if (tr && tr.status === 'ok') Voice.say(tr.text, S.hearsLang);
         }
       }
+      S.suppressTts = false;
 
       if (S.room.endedAt && S.route.name === 'room') {
         Speech.stop(); Voice.clear();
@@ -1046,7 +1224,10 @@
     const limits = (S.config && S.config.limits) || {};
     const idleAfter = limits.POLL_IDLE_AFTER_MS || 45000;
     if (Date.now() - S.lastChangeAt > idleAfter) return limits.POLL_IDLE_MS || 2500;
-    return limits.POLL_ACTIVE_MS || 900;
+    // A large room polls slower on purpose: two hundred tabs at 900ms is a
+    // load the room's own shape does not need, because a townhall audience is
+    // reading rather than interrupting.
+    return tierOf().pollActiveMs || limits.POLL_ACTIVE_MS || 900;
   }
 
   function startPolling() {
@@ -1062,7 +1243,13 @@
     S.pollTimer = null;
   }
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && S.route && S.route.name === 'room') poll();
+    if (!document.hidden && S.route && S.route.name === 'room') {
+      // Whatever arrived while we were away is history now — show it, do not
+      // perform it. Anything that lands after this poll is spoken normally.
+      S.suppressTts = true;
+      Voice.clear();
+      poll();
+    }
   });
 
   function renderRoomNotFound() {
@@ -1136,6 +1323,11 @@
       return;
     }
     const l = m.latency || {};
+    const c = m.cost || {};
+    const tierLabel = (key) => {
+      const t = ((S.config && S.config.tiers) || []).find((x) => x.key === key);
+      return t ? t.label : (key || 'unknown');
+    };
     const row = (label, value, hint) => `
       <div class="flex items-baseline justify-between gap-3 px-3 py-2.5 rounded-lg bg-zinc-900">
         <span class="text-sm text-zinc-400">${esc(label)}</span>
@@ -1150,9 +1342,48 @@
           <h2 class="text-xs uppercase tracking-wide text-zinc-500">Caption latency (7 days)</h2>
           ${row('p50 latency', l.p50 != null ? `${l.p50} ms` : '—')}
           ${row('p95 latency', l.p95 != null ? `${l.p95} ms` : '—')}
+          ${row('p50 first word', l.ttft_p50 != null ? `${l.ttft_p50} ms` : '—', 'streamed')}
+          ${row('p95 first word', l.ttft_p95 != null ? `${l.ttft_p95} ms` : '—', 'streamed')}
           ${row('captions produced', l.n || 0)}
           ${row('failed', l.errors || 0)}
           ${row('unavailable', l.unavailable || 0)}
+        </section>
+
+        <section class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Latency by room size (7 days)</h2>
+          ${(m.byTier || []).length
+            ? (m.byTier || []).map((t) => row(
+              tierLabel(t.tier),
+              `${t.p50 != null ? `${t.p50} ms` : '—'} / ${t.p95 != null ? `${t.p95} ms` : '—'}`,
+              `${t.n} captions`
+            )).join('')
+            : '<p class="text-sm text-zinc-600">No captions in this window.</p>'}
+        </section>
+
+        <section class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Cost (7 days)</h2>
+          ${row('Cost per call', c.centsPerCall != null ? `${c.centsPerCall.toFixed(4)}¢` : '—', 'proxy meter')}
+          ${row('translation calls', c.calls || 0)}
+          ${row('sentences said', c.utterances || 0)}
+          ${row('listeners per call', l.avg_group_size != null ? `${l.avg_group_size}×` : '—', 'grouping payoff')}
+          ${row('sittings recorded', c.sessions || 0)}
+        </section>
+
+        <section class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Budget degradation (7 days)</h2>
+          ${row('largest group only', (m.degraded && m.degraded.shed_small) || 0, '≥70% of cap')}
+          ${row('floor-holders only', (m.degraded && m.degraded.floor_only) || 0, '≥90% of cap')}
+          ${row('transcript only', (m.degraded && m.degraded.transcript_only) || 0, 'cap spent')}
+        </section>
+
+        <section class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Translation engines</h2>
+          ${(m.engines || []).map((e) => row(
+            e.label || e.id,
+            e.active ? 'active' : (e.available ? 'available' : 'blocked'),
+            e.blockedReason ? 'platform capability missing' : `queue ${e.queueDepth || 0}`
+          )).join('')}
+          ${row('dial-in', m.dialIn && m.dialIn.available ? 'available' : 'coming soon')}
         </section>
 
         <section class="space-y-1.5">
@@ -1281,13 +1512,55 @@
     // set, which a screenshot would never show.
     if (window.usernode && window.usernode.invariants) {
       window.usernode.invariants.register('feed-matches-roster-languages', function () {
-        if (!S.room || !S.participants.size) return true;
-        const listening = new Set(
-          Array.from(S.participants.values()).filter((p) => !p.left && !p.removed).map((p) => p.hearsLang)
+        if (!S.room) return true;
+        // A large room sends language GROUPS instead of rows, so read the
+        // groups there — the cap is a property of the room, not of whichever
+        // roster shape happens to be on screen.
+        const aggregated = S.rosterMode === 'aggregate';
+        if (!aggregated && !S.participants.size) return true;
+        if (aggregated && !S.langGroups.length) return true;
+        const listening = aggregated
+          ? new Set(S.langGroups.map((g) => g.lang))
+          : new Set(
+            Array.from(S.participants.values()).filter((p) => !p.left && !p.removed).map((p) => p.hearsLang)
+          );
+        const tier = tierOf();
+        // Join enforces exactly this ceiling on DISTINCT listening languages,
+        // so a roster over it means the cap leaked, not that the room grew.
+        const max = Math.min(
+          tier.maxTargetLangs || 4,
+          (S.config && S.config.limits.MAX_TARGET_LANGS) || 4
         );
-        const max = (S.config && S.config.limits.MAX_TARGET_LANGS) || 4;
         if (listening.size > max) {
           return `roster carries ${listening.size} listening languages, over the ${max} cap`;
+        }
+        return true;
+      });
+
+      // The floor is the app's spend valve as much as its turn-taking rule:
+      // more people holding it than the tier allows means more concurrent
+      // fan-outs than the room was sized for.
+      window.usernode.invariants.register('speaker-slots-within-tier-cap', function () {
+        if (!S.room || !S.activeSpeakers) return true;
+        const slots = tierOf().speakerSlots || 1;
+        if (S.activeSpeakers.length > slots) {
+          return `${S.activeSpeakers.length} speakers hold the floor, tier allows ${slots}`;
+        }
+        return true;
+      });
+
+      // A provisional caption must never be one we already read aloud —
+      // hearing half a sentence and then the whole sentence again is the
+      // single worst failure mode streaming captions can have.
+      window.usernode.invariants.register('no-tts-for-partial-captions', function () {
+        const spoken = [];
+        for (const el of document.querySelectorAll('.utterance')) {
+          if (!el.querySelector('.translation.partial')) continue;
+          const id = Number(el.getAttribute('data-utterance-id'));
+          if (S.spokenIds.has(id)) spoken.push(id);
+        }
+        if (spoken.length) {
+          return `${spoken.length} caption(s) went back to provisional after being spoken`;
         }
         return true;
       });
@@ -1308,6 +1581,15 @@
           myRole: S.me && S.me.role,
           speaks: S.prefs.speaksLang,
           hears: S.hearsLang,
+          tier: S.tier && S.tier.key,
+          rosterMode: S.rosterMode,
+          participantCount: S.participantCount,
+          langGroups: (S.langGroups || []).map((g) => `${g.lang}:${g.size}:${g.status}`),
+          activeSpeakers: (S.activeSpeakers || []).length,
+          queueLength: (S.queue || []).length,
+          myQueuePosition: S.myQueuePosition,
+          degradeLevel: S.budget && S.budget.level,
+          dialInAvailable: !!(S.dialIn && S.dialIn.available),
           participants: S.participants.size,
           utterancesInFeed: S.utterances.size,
           cursor: S.cursor,
