@@ -12,6 +12,8 @@ const floor = require('./lib/floor');
 const cost = require('./lib/cost');
 const langgroups = require('./lib/langgroups');
 const telephony = require('./lib/bridge/telephony');
+const stream = require('./lib/stream');
+const latencyLog = require('./lib/latency');
 
 const {
   LANG_CODES, LANG_BY_CODE, PURPOSE_KEYS, LIMITS,
@@ -168,6 +170,10 @@ function publicTier(tier) {
     rosterMode: tier.rosterMode,
     handQueue: tier.handQueue,
     pollActiveMs: tier.pollActiveMs,
+    // The client must not decide for itself whether to hold a request open:
+    // one source of truth, so a tier upgrade changes the transport for both
+    // ends at the same moment.
+    longPoll: !!tier.longPoll,
   };
 }
 
@@ -225,6 +231,7 @@ app.get('/api/config', (_req, res) => {
     tierByPurpose: PURPOSE_TIER,
     degrade: CONFIG.DEGRADE_THRESHOLDS,
     limits: LIMITS,
+    latency: CONFIG.LATENCY,
     llmEnabled: translator.LLM_ENABLED,
     engine: translator.activeEngineId(),
     dialIn: telephony.status(),
@@ -544,7 +551,28 @@ app.patch('/api/rooms/:code/me', async (req, res) => {
       [room.id, req.user.id, speaks, hears, micOn, tts, hand, seq]
     );
     await client.query('COMMIT');
-    res.json({ ok: true, seq });
+
+    // A speaker who changed the language they speak has started a new thread
+    // of reference; the old translation session would answer the wrong
+    // sentence.
+    if (speaks !== me.speaks_lang) translator.resetSpeaker(room.id, req.user.id);
+
+    // Switching the language you HEAR strands everything already on screen,
+    // because no caption row exists for the language you just picked. Ask for
+    // a small catch-up. Fire and forget: the switch itself must land at once,
+    // and the captions arrive over the cursor stream like any others.
+    let backfilling = 0;
+    if (hears !== me.hears_lang) {
+      backfilling = Math.min(CONFIG.LATENCY.BACKFILL_UTTERANCES, 5);
+      if (await rateAllows('lang_switch', `user:${req.user.id}`, 3, '1 minute')) {
+        backfillForListener(room, hears, req.user.id, req.userToken)
+          .catch((err) => console.error('[backfill]', err.message));
+      } else {
+        backfilling = 0;
+      }
+    }
+
+    res.json({ ok: true, seq, backfilling });
   } catch (err) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: err.message });
@@ -819,9 +847,17 @@ async function fanOutTranslations(room, utterance, userToken, opts) {
   }
 
   for (const group of targets) {
-    const target = group.lang;
-    const groupSize = sizeOf[target] || 1;
+    translateInto(room, utterance, group.lang, sizeOf[group.lang] || 1, userToken,
+      { tier, degrade, engineId });
+  }
+}
 
+// One target language, start to finish: place the pending row, run the call,
+// write the result. Split out of the fan-out loop because the language-switch
+// backfill needs exactly this and must not get a second, drifting copy of it.
+async function translateInto(room, utterance, target, groupSize, userToken, ctx) {
+  const { tier, degrade, engineId } = ctx;
+  {
     // Insert the pending row first so listeners see "translating…" rather
     // than a caption that appears out of nowhere a second later.
     let placed = false;
@@ -847,9 +883,11 @@ async function fanOutTranslations(room, utterance, userToken, opts) {
       }
     } catch (err) {
       console.error('[translate] pending insert failed:', err.message);
-      continue;
+      return;
     }
-    if (!placed) continue;
+    // Someone already placed this caption (a re-fan-out, or a backfill racing
+    // the live fan-out). Not an error, just nothing left to do.
+    if (!placed) return;
 
     // EVERY fan-out path goes through enqueue(): serial per (room, target) so
     // a listener's captions arrive in the order they were spoken, and shed
@@ -857,6 +895,8 @@ async function fanOutTranslations(room, utterance, userToken, opts) {
     translator.enqueue(room.id, target, async () => {
       const result = await translator.translate({
         roomId: room.id,
+        // The session this caption belongs to. Per speaker, not per room.
+        speakerUserId: utterance.speaker_user_id,
         sourceLang: utterance.source_lang,
         targetLang: target,
         sourceText: utterance.source_text,
@@ -887,7 +927,7 @@ async function fanOutTranslations(room, utterance, userToken, opts) {
           await client.query(
             `UPDATE utterance_translations
              SET text=$3, status=$4, latency_ms=$5, ttft_ms=$6, seq=$7,
-                 group_size=$8, engine_id=$9
+                 group_size=$8, engine_id=$9, finalized_at=NOW()
              WHERE utterance_id=$1 AND target_lang=$2`,
             [utterance.id, target,
               retracted ? null : result.text,
@@ -911,7 +951,8 @@ async function fanOutTranslations(room, utterance, userToken, opts) {
         + `tgt=${target} group=${groupSize} status=${result.status} `
         + `ttft=${result.ttftMs == null ? '-' : result.ttftMs} `
         + `lat=${result.latencyMs == null ? '-' : result.latencyMs} `
-        + `code=${result.code || '-'} degrade=${degrade}`);
+        + `code=${result.code || '-'} degrade=${degrade} `
+        + `cap=${tier.maxTargetLangs} capture=${utterance.capture_ms == null ? '-' : utterance.capture_ms}`);
 
       return result;
     });
@@ -942,9 +983,89 @@ async function writePartial(roomId, utteranceId, target, text) {
   }
 }
 
+// --- backfill on a language switch -------------------------------------------
+// Changing the language you hear used to strand every sentence already on
+// screen: no `utterance_translations` row exists for the new target, so the
+// feed said "waiting for a caption" forever. Nothing was going to write one,
+// because fan-out only ever runs for the languages present when a sentence
+// was spoken.
+//
+// So the switch itself asks for a small, bounded catch-up: the last few
+// sentences, translated into the language you just picked. Bounded on
+// purpose. Re-translating a whole call because someone tapped a flag is a
+// cost bomb, and the degradation ladder outranks convenience — when the room
+// is already shedding captions this does nothing at all.
+async function backfillForListener(room, targetLang, listenerUserId, userToken) {
+  const degrade = cost.level(room.id);
+  if (degrade !== 'normal' || room.mode === 'transcript_only') return 0;
+
+  const tier = tierFor(room);
+  const engineId = translator.activeEngineId();
+
+  let rows;
+  try {
+    const r = await pool.query(
+      `SELECT u.* FROM utterances u
+        WHERE u.room_id = $1
+          AND u.retracted = FALSE
+          AND u.speaker_user_id <> $2
+          AND u.source_lang <> $3
+          AND NOT EXISTS (
+            SELECT 1 FROM utterance_translations t
+             WHERE t.utterance_id = u.id AND t.target_lang = $3
+          )
+        ORDER BY u.seq DESC
+        LIMIT $4`,
+      [room.id, listenerUserId, targetLang, CONFIG.LATENCY.BACKFILL_UTTERANCES]
+    );
+    rows = r.rows;
+  } catch (err) {
+    console.error('[backfill] lookup failed:', err.message);
+    return 0;
+  }
+
+  // Oldest first so the catch-up reads in the order it was said.
+  for (const utterance of rows.reverse()) {
+    translateInto(room, utterance, targetLang, 1, userToken, { tier, degrade, engineId });
+  }
+  if (rows.length) {
+    console.log(`[backfill] room=${room.id} tgt=${targetLang} n=${rows.length}`);
+  }
+  return rows.length;
+}
+
+// --- delivery latency --------------------------------------------------------
+// The listener reports how long a finished caption took to reach the screen.
+// It sends a duration it measured, never a timestamp, so no clock skew enters
+// the number; the server supplies the capture and translate legs itself from
+// rows it already wrote, which also means a client cannot invent them.
+app.post('/api/rooms/:code/latency', async (req, res) => {
+  try {
+    const room = await findRoom(req.params.code);
+    if (!room) return res.status(404).json({ error: 'Room not found', code: 'room_not_found' });
+    if (!(await rateAllows('latency', `user:${req.user.id}`, 30, '1 minute'))) {
+      // Telemetry is never worth an error the user has to read.
+      return res.json({ ok: true, written: 0, throttled: true });
+    }
+    const written = await latencyLog.record(
+      pool, room.id, tierFor(room).key, req.body && req.body.samples
+    );
+    res.json({ ok: true, written });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/rooms/:code/utterances', async (req, res) => {
   const text = String((req.body && req.body.text) || '').trim();
   const via = (req.body && req.body.via) === 'typed' ? 'typed' : 'voice';
+  // Capture leg: how long the browser's recogniser held the phrase before it
+  // called it final. Only the browser can see it, so it reports it — and only
+  // for voice, because a typing pause is a person thinking, not a delay the
+  // app can shorten.
+  const rawCapture = Number(req.body && req.body.captureMs);
+  const captureMs = via === 'voice' && Number.isFinite(rawCapture)
+    && rawCapture >= 0 && rawCapture <= 120000 ? Math.round(rawCapture) : null;
   if (!text) return res.status(400).json({ error: 'empty_text' });
   if (text.length > LIMITS.MAX_UTTERANCE_CHARS) {
     return res.status(400).json({ error: 'too_long', max: LIMITS.MAX_UTTERANCE_CHARS });
@@ -975,9 +1096,10 @@ app.post('/api/rooms/:code/utterances', async (req, res) => {
       await client.query('BEGIN');
       const seq = await bumpSeq(client, room.id);
       const { rows } = await client.query(
-        `INSERT INTO utterances (room_id, speaker_user_id, speaker_username, source_lang, source_text, via, seq)
-         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-        [room.id, req.user.id, req.user.username, sourceLang, text, via, seq]
+        `INSERT INTO utterances
+           (room_id, speaker_user_id, speaker_username, source_lang, source_text, via, seq, capture_ms)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+        [room.id, req.user.id, req.user.username, sourceLang, text, via, seq, captureMs]
       );
       utterance = rows[0];
       await client.query(
@@ -1074,162 +1196,46 @@ app.post('/api/rooms/:code/utterances/:id/report', async (req, res) => {
 });
 
 // --- the cursor stream -----------------------------------------------------
-// Everything the room UI needs, filtered to what changed since `since`.
-// A monotonic per-room `seq` is what makes polling cheap: the client only
-// ever asks for the tail, and a reconnect after a dropped network is the
-// same request with an older cursor.
+// Assembly lives in lib/stream.js. What stays here is the route: auth is
+// already applied above, the helpers are this file's, and the only decision
+// left is whether to answer immediately or hold the request open.
+const STREAM_DEPS = {
+  pool, langgroups, floor, cost, telephony,
+  getParticipant, tierFor, publicTier, publicRoom, publicParticipant,
+};
+
 app.get('/api/rooms/:code/stream', async (req, res) => {
   const since = Math.max(0, parseInt(req.query.since, 10) || 0);
+  const wantsWait = req.query.wait === '1';
   try {
-    const room = await findRoom(req.params.code);
+    let room = await findRoom(req.params.code);
     // An unknown code is an ordinary answer here, not a transport failure: this
     // endpoint is hit by a plain page load, and a 404 makes the browser log a
     // console error that fails the baseline no-console-errors check. The
     // mutating routes below still 404 properly — nothing loads them on boot.
     if (!room) return res.json({ notFound: true, seq: 0 });
 
-    const me = await getParticipant(room.id, req.user.id);
-    const isMember = !!me && !me.removed && !me.left_at;
-    if (isMember) {
-      await pool.query(
-        'UPDATE room_participants SET last_seen_at = NOW() WHERE room_id = $1 AND user_id = $2',
-        [room.id, req.user.id]
-      );
-    }
-    // A non-member reading a room is a real product state (you followed a
-    // share link and have not joined yet), not a staging-only branch — it is
-    // read-only, and it behaves identically in production.
-    const hears = me ? me.hears_lang : null;
-
+    // Long poll. Holding the request removes the client's idle tick from the
+    // delivery leg entirely: the caption ships the moment it is written
+    // instead of up to a full interval later. Small rooms only — a held
+    // request per listener is exactly what does not scale to an audience of
+    // hundreds, which is why the tier carries the flag.
     const tier = tierFor(room);
-    // A large room's roster is not something a poll can carry row by row, and
-    // it is not what the room needs to show either: "three languages, 61 / 74
-    // / 65 people" is the useful shape. Small rooms still send every row,
-    // because there you want to see faces and hands.
-    const aggregated = tier.rosterMode === 'aggregate';
-    const rosterLimit = aggregated ? 0 : Math.min(tier.maxParticipants, 200);
-
-    const [participants, utterances, translations] = await Promise.all([
-      rosterLimit
-        ? pool.query(
-          `SELECT * FROM room_participants WHERE room_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3`,
-          [room.id, since, rosterLimit]
-        )
-        : Promise.resolve({ rows: [] }),
-      pool.query(
-        `SELECT * FROM utterances WHERE room_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT 200`,
-        [room.id, since]
-      ),
-      pool.query(
-        `SELECT * FROM utterance_translations WHERE room_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT 400`,
-        [room.id, since]
-      ),
-    ]);
-
-    // On a cold cursor also send the recent backlog so a joiner (or a
-    // reconnect that lost its place) sees the conversation, not a blank feed.
-    let backlog = { utterances: [], translations: [] };
-    if (since === 0) {
-      const u = await pool.query(
-        `SELECT * FROM (
-           SELECT * FROM utterances WHERE room_id = $1 ORDER BY seq DESC LIMIT 40
-         ) t ORDER BY seq ASC`,
-        [room.id]
-      );
-      const ids = u.rows.map((r) => r.id);
-      const t = ids.length
-        ? await pool.query(
-          'SELECT * FROM utterance_translations WHERE utterance_id = ANY($1::bigint[])',
-          [ids]
-        )
-        : { rows: [] };
-      backlog = { utterances: u.rows, translations: t.rows };
+    const held = wantsWait && tier.longPoll && since > 0 && !room.ended_at && !shuttingDown
+      && Number(room.seq) <= since;
+    if (held) {
+      await stream.waitForChange(pool, room.id, since, { isShuttingDown: () => shuttingDown });
+      // The client is still connected only if it is: a browser that navigated
+      // away during the hold leaves nothing worth assembling.
+      if (res.writableEnded || req.destroyed) return;
+      const fresh = await findRoom(req.params.code);
+      if (!fresh) return res.json({ notFound: true, seq: 0 });
+      room = fresh;
     }
 
-    // Always sent, at every tier — one cheap GROUP BY, and it is what the
-    // aggregate roster, the invariant check and the "who can hear me" line in
-    // the composer are all built out of.
-    const [groups, statuses, holders, queue, counts] = await Promise.all([
-      langgroups.languageGroups(pool, room.id),
-      langgroups.groupStatuses(pool, room.id),
-      floor.activeSpeakers(pool, room.id),
-      tier.handQueue ? floor.queueFor(pool, room.id, 20) : Promise.resolve([]),
-      pool.query(
-        `SELECT COUNT(*)::int AS n FROM room_participants
-          WHERE room_id = $1 AND left_at IS NULL AND removed = FALSE`,
-        [room.id]
-      ),
-    ]);
-
-    const langGroups = groups.map((g) => ({
-      lang: g.lang,
-      size: g.size,
-      speaking: g.speaking,
-      hands: g.hands,
-      // 'off' is the room's own choice, not a failure — say so differently.
-      status: room.mode === 'transcript_only' ? 'off' : (statuses[g.lang] || 'idle'),
-    }));
-
-    const myQueuePosition = queue.findIndex((q) => q.userId === req.user.id) + 1 || null;
-
-    const mergeById = (a, b) => {
-      const seen = new Map();
-      for (const row of [...a, ...b]) seen.set(String(row.id), row);
-      return [...seen.values()];
-    };
-
-    const allUtterances = mergeById(backlog.utterances, utterances.rows)
-      .sort((a, b) => Number(a.seq) - Number(b.seq));
-    const allTranslations = mergeById(backlog.translations, translations.rows);
-
-    const byUtterance = new Map();
-    for (const t of allTranslations) {
-      const key = String(t.utterance_id);
-      if (!byUtterance.has(key)) byUtterance.set(key, []);
-      byUtterance.get(key).push(t);
-    }
-
-    const roomOut = publicRoom(room);
-    roomOut.activeSpeakerUserIds = holders.map((h) => h.userId);
-
-    res.json({
-      room: roomOut,
-      me: me ? publicParticipant(me) : null,
-      isMember,
-      hearsLang: hears,
-      seq: Number(room.seq),
-      tier: publicTier(tier),
-      rosterMode: tier.rosterMode,
-      participantCount: counts.rows[0].n,
-      langGroups,
-      activeSpeakers: holders,
-      queue,
-      myQueuePosition,
-      // The host sees a percentage and a rung, never a dollar figure — the
-      // meter belongs to the speaker's own platform budget, not to this app.
-      budget: room.host_user_id === req.user.id ? cost.budgetFor(room.id) : null,
-      dialIn: telephony.status(),
-      participants: participants.rows.map(publicParticipant),
-      utterances: allUtterances.map((u) => ({
-        id: Number(u.id),
-        speakerUserId: u.speaker_user_id,
-        speakerUsername: u.speaker_username,
-        sourceLang: u.source_lang,
-        sourceText: u.retracted ? null : u.source_text,
-        retracted: u.retracted,
-        via: u.via,
-        seq: Number(u.seq),
-        createdAt: u.created_at,
-        translations: (byUtterance.get(String(u.id)) || []).map((t) => ({
-          targetLang: t.target_lang,
-          text: u.retracted ? null : t.text,
-          status: t.status,
-          latencyMs: t.latency_ms,
-          ttftMs: t.ttft_ms,
-          groupSize: t.group_size,
-        })),
-      })),
-    });
+    const payload = await stream.assemble(STREAM_DEPS, { room, user: req.user, since });
+    payload.held = held;
+    res.json(payload);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1303,7 +1309,7 @@ app.get('/api/rooms/:code/summary', async (req, res) => {
 // --- metrics (Stage 7) -----------------------------------------------------
 app.get('/api/metrics', async (req, res) => {
   try {
-    const [latency, rollups, grants, live, byTier, spend, degraded] = await Promise.all([
+    const [latency, rollups, grants, live, byTier, spend, degraded, endToEnd] = await Promise.all([
       pool.query(
         `SELECT
            COUNT(*)::int AS n,
@@ -1358,12 +1364,16 @@ app.get('/api/metrics', async (req, res) => {
           WHERE started_at > NOW() - INTERVAL '7 days' AND degraded_to IS NOT NULL
           GROUP BY degraded_to`
       ),
+      // The three legs of the wait, measured separately. `latency` above is
+      // the middle one only.
+      latencyLog.endToEnd(pool),
     ]);
     const grantMap = Object.fromEntries(grants.rows.map((r) => [r.outcome, r.n]));
     const asked = (grantMap.granted || 0) + (grantMap.declined || 0) + (grantMap.dismissed || 0);
     res.json({
       isAdmin: isAdmin(req.user),
       latency: latency.rows[0],
+      endToEnd,
       daily: rollups.rows,
       grants: {
         ...grantMap,
@@ -1386,6 +1396,7 @@ app.get('/api/metrics', async (req, res) => {
       degraded: Object.fromEntries(degraded.rows.map((r) => [r.degraded_to, r.n])),
       engines: translator.engineStatus(),
       engine: translator.activeEngineId(),
+      translationSessions: translator.sessionCount(),
       dialIn: telephony.status(),
       llmEnabled: translator.LLM_ENABLED,
     });
@@ -1428,6 +1439,12 @@ async function houseKeeping() {
       [LIMITS.RETENTION_HOURS]
     );
     await pool.query(`DELETE FROM rate_events WHERE created_at < NOW() - INTERVAL '2 hours'`);
+    // Latency samples are aggregates, not content, but they are also not
+    // interesting past the window the metrics screen reads.
+    await latencyLog.prune(pool);
+    // In-memory translation sessions nobody has spoken into for ten minutes.
+    const dropped = translator.sweepSessions();
+    if (dropped) console.log(`[housekeeping] dropped ${dropped} idle translation sessions`);
     // Lapsed floor leases. Claiming already reaps, but a room that went quiet
     // should not keep showing a speaker who left an hour ago.
     await pool.query(`DELETE FROM active_speakers WHERE until <= NOW() - INTERVAL '5 minutes'`);

@@ -90,6 +90,16 @@
     // A tab that was hidden comes back to a backlog. Reading four minutes of
     // captions aloud at once is noise, not translation.
     suppressTts: false,
+    // When this listener last changed the language they hear. Sentences older
+    // than this were spoken to a room that had no caption for them, and the
+    // feed says so instead of pretending one is still coming.
+    langSwitchedAt: 0,
+    backfilling: 0,
+    // Delivery-latency samples measured in this tab, batched to the server.
+    latency: { pending: [], recent: [], lastSentAt: 0, sampled: new Set() },
+    // Did the last /stream call hold the connection open, and is it worth
+    // asking it to. Server decides; this is only what it last answered.
+    held: false,
   };
 
   // The room's tier, with a shape that is safe to read before the first poll
@@ -241,14 +251,26 @@
       S.prefs.ttsEnabled = e.target.checked;
     });
     overlay.querySelector('#lang-save').addEventListener('click', async () => {
+      const hadHears = S.hearsLang;
       try {
         const r = await api('/api/me/prefs', { method: 'PUT', body: S.prefs });
         S.prefs = r.prefs;
         if (S.route && S.route.name === 'room' && S.isMember) {
-          await api(`/api/rooms/${S.route.code}/me`, {
+          const patched = await api(`/api/rooms/${S.route.code}/me`, {
             method: 'PATCH',
             body: { speaksLang: S.prefs.speaksLang, hearsLang: S.prefs.hearsLang, ttsEnabled: S.prefs.ttsEnabled },
           });
+          if (S.prefs.hearsLang !== hadHears) {
+            // Everything already on screen was said for the old language. Mark
+            // the moment so a caption with no row for the new one can say why,
+            // instead of looking like it is still loading.
+            S.langSwitchedAt = Date.now();
+            S.latency.sampled.clear();
+            S.backfilling = patched.backfilling || 0;
+            if (S.backfilling) {
+              notify(`Bahasa diganti. ${S.backfilling} kalimat terakhir sedang diterjemahkan ulang.`);
+            }
+          }
           S.cursor = 0;
         }
         notify('Languages saved');
@@ -395,6 +417,10 @@
     rec: null,
     wantListening: false,
     suppressed: false,
+    // When the recogniser first produced anything for the phrase now being
+    // spoken. The gap between that and the final transcript is the capture
+    // leg of the latency budget, and this clock is the only one that sees it.
+    phraseStartedAt: 0,
     stream: null,
     audioCtx: null,
     analyser: null,
@@ -423,8 +449,12 @@
           const r = ev.results[i];
           const text = (r[0] && r[0].transcript ? r[0].transcript : '').trim();
           if (!text) continue;
-          if (r.isFinal) this.onFinal(text);
-          else interim += ` ${text}`;
+          if (!this.phraseStartedAt) this.phraseStartedAt = Date.now();
+          if (r.isFinal) {
+            const captureMs = this.phraseStartedAt ? Date.now() - this.phraseStartedAt : null;
+            this.phraseStartedAt = 0;
+            this.onFinal(text, captureMs);
+          } else interim += ` ${text}`;
         }
         setInterim(interim.trim());
       };
@@ -453,6 +483,7 @@
 
     stop() {
       this.wantListening = false;
+      this.phraseStartedAt = 0;
       if (this.rec) { try { this.rec.stop(); } catch { /* ignore */ } }
       this.rec = null;
       this.stopLevelMeter();
@@ -579,6 +610,16 @@
   }
 
   // --- room ----------------------------------------------------------------
+  // A caption with no row for your language is only MISSING once it is old
+  // enough that the fan-out would have written one by now. Before that it is
+  // simply still coming, which is a different sentence to show.
+  function captionIsMissing(u) {
+    const grace = ((S.config && S.config.latency) || {}).CAPTION_GRACE_MS || 15000;
+    const at = new Date(u.createdAt).getTime();
+    if (!Number.isFinite(at)) return false;
+    return Date.now() - at > grace;
+  }
+
   function utteranceHTML(u) {
     const mine = S.me && u.speakerUserId === S.me.userId;
     const target = S.hearsLang;
@@ -606,6 +647,17 @@
       translationBlock = `<p class="translation text-sm text-amber-400/80">Translation unavailable here — showing the original.</p>`;
     } else if (tr) {
       translationBlock = `<p class="translation text-sm text-red-400/80">Translation failed. The original is above.</p>`;
+    } else if (captionIsMissing(u)) {
+      // No row for this language, and the sentence is old enough that one is
+      // not on its way. Usually because the listener changed hearing language
+      // after it was said, so name that rather than spinning forever.
+      const switched = S.langSwitchedAt
+        && new Date(u.createdAt).getTime() < S.langSwitchedAt;
+      translationBlock = `<p class="translation missing text-sm text-zinc-500">${
+        switched
+          ? `Diucapkan sebelum Anda pindah bahasa. Tidak ada teks ${esc(langOf(target).label)} untuk kalimat ini.`
+          : `Tidak ada teks ${esc(langOf(target).label)} untuk kalimat ini. Yang asli ada di atas.`
+      }</p>`;
     } else {
       translationBlock = `<p class="translation text-sm text-zinc-500">Waiting for a ${esc(langOf(target).label)} caption…</p>`;
     }
@@ -773,8 +825,37 @@
         </div>`;
     }
 
-    const listening = Speech.wantListening;
     const tier = tierOf();
+
+    if (!Speech.supported()) {
+      // No SpeechRecognition here (Firefox, most in-app browsers). Say so up
+      // front and hand over a typing box, rather than showing a mic button
+      // that only explains itself after it has failed.
+      const queueLineTyped = tier.handQueue && S.myQueuePosition
+        ? `<p id="queue-status" class="text-xs text-amber-300 px-1">✋ Nomor ${S.myQueuePosition} dalam antrean.</p>`
+        : '';
+      return `
+        <div class="space-y-2">
+          ${queueLineTyped}
+          <div id="stt-unsupported" class="p-2.5 rounded-lg bg-zinc-900 text-xs text-zinc-400">
+            Peramban ini tidak punya pengenalan suara, jadi mikrofon dimatikan.
+            Ketik kalimat Anda dan semuanya berjalan seperti biasa: teks asli terkirim,
+            terjemahan tetap dibuat, dan peserta lain tetap mendengarnya dibacakan.
+          </div>
+          <p id="mic-error" class="hidden text-xs text-amber-400"></p>
+          <form id="type-form" class="flex gap-2">
+            <input id="type-input" maxlength="${(S.config && S.config.limits.MAX_UTTERANCE_CHARS) || 500}"
+                   placeholder="Ketik dalam ${esc(langOf(S.prefs.speaksLang).label)}"
+                   class="flex-1 px-3 py-2.5 rounded-xl bg-zinc-900 text-sm placeholder-zinc-600 outline-none focus:ring-1 focus:ring-violet-500">
+            <button class="un-pressable px-4 rounded-xl bg-violet-600 text-white text-sm font-medium">Kirim</button>
+          </form>
+          <button id="tts-quick" class="un-pressable w-full py-2 rounded-xl bg-zinc-800 text-sm">
+            ${S.prefs.ttsEnabled ? '🔊 Terjemahan dibacakan' : '🔇 Terjemahan tidak dibacakan'}
+          </button>
+        </div>`;
+    }
+
+    const listening = Speech.wantListening;
     // In a tier with a queue, a refused floor claim is not an error — it is a
     // position. The server puts your hand up for you when it refuses, so this
     // line is a database fact rather than a guess.
@@ -804,6 +885,29 @@
           <button class="un-pressable px-4 rounded-xl bg-zinc-800 text-sm">Send</button>
         </form>
       </div>`;
+  }
+
+  // One line, host only. The full breakdown lives on the metrics screen; what
+  // a host needs mid-call is whether captions are landing late right now.
+  function hostLatencyHTML() {
+    const recent = S.latency.recent;
+    if (!recent.length) return '';
+    const sorted = recent.map((r) => r.deliverMs).sort((a, b) => a - b);
+    const med = sorted[Math.floor(sorted.length / 2)];
+    const worst = sorted[sorted.length - 1];
+    return `<p id="host-latency" class="text-[11px] text-zinc-700 px-1">
+      Pengiriman teks: ${med} ms tengah, ${worst} ms terburuk, dari ${sorted.length} kalimat terakhir.
+    </p>`;
+  }
+
+  // Naming the number is the whole point. "Reconnecting" alone leaves you
+  // wondering whether the three sentences you just said are gone.
+  function reconnectCopy() {
+    const queued = S.route && S.route.code
+      ? outbox.read().filter((i) => i.code === S.route.code).length
+      : 0;
+    if (!queued) return 'Sambungan putus. Kami mencoba menyambung lagi, dan apa pun yang Anda ucapkan akan diantre.';
+    return `Sambungan putus. ${queued} kalimat menunggu di antrean dan akan terkirim begitu sambungan pulih.`;
   }
 
   // Shown to the host only, and as a rung plus a percentage — never a dollar
@@ -844,7 +948,7 @@
       <main class="max-w-2xl mx-auto px-4 py-4 space-y-4"
             style="padding-bottom: calc(2rem + var(--un-safe-inset-bottom, env(safe-area-inset-bottom, 0px)))">
 
-        ${!S.connected ? `<div class="p-2.5 rounded-lg bg-amber-500/10 text-amber-300 text-xs">Reconnecting… anything you say is queued and will be sent.</div>` : ''}
+        ${!S.connected ? `<div id="reconnect-notice" class="p-2.5 rounded-lg bg-amber-500/10 text-amber-300 text-xs">${reconnectCopy()}</div>` : ''}
         ${room.endedAt ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">This call has ended.</div>` : ''}
         ${room.mode === 'transcript_only' ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-300 text-xs">Transcript-only mode: everything is captured in the original language, nothing is translated.</div>` : ''}
         ${S.config && !S.config.llmEnabled ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">Live translation is unavailable in this environment — captions show the original language.</div>` : ''}
@@ -859,6 +963,8 @@
         </div>
 
         ${composerHTML()}
+
+        ${isHost ? hostLatencyHTML() : ''}
 
         ${!S.isMember ? '' : isHost ? `
           <div class="flex gap-2">
@@ -1088,15 +1194,21 @@
     catch { /* the lease expires on its own */ }
   }
 
-  async function onFinalTranscript(text) {
+  async function onFinalTranscript(text, captureMs) {
     if (!await claimFloor()) return;
     setMicError('');
-    await sendUtterance(text, 'voice');
+    await sendUtterance(text, 'voice', captureMs);
   }
 
-  async function sendUtterance(text, via) {
+  async function sendUtterance(text, via, captureMs) {
     const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const item = { id: localId, code: S.route.code, text, via, sourceLang: S.prefs.speaksLang };
+    const item = {
+      id: localId, code: S.route.code, text, via, sourceLang: S.prefs.speaksLang,
+      // Queued in the outbox with the sentence, so a phrase that waited out a
+      // dropped connection still reports the capture time it actually had
+      // rather than the time it spent offline.
+      captureMs: typeof captureMs === 'number' ? Math.round(captureMs) : null,
+    };
     outbox.add(item);
     await flushOutbox();
   }
@@ -1107,7 +1219,10 @@
       try {
         await api(`/api/rooms/${item.code}/utterances`, {
           method: 'POST',
-          body: { text: item.text, via: item.via, sourceLang: item.sourceLang },
+          body: {
+            text: item.text, via: item.via, sourceLang: item.sourceLang,
+            captureMs: item.captureMs,
+          },
         });
         outbox.remove(item.id);
         S.connected = true;
@@ -1129,7 +1244,16 @@
   async function poll() {
     if (!S.route || S.route.name !== 'room') return;
     try {
-      const data = await api(`/api/rooms/${S.route.code}/stream?since=${S.cursor}`);
+      // Long poll where the tier allows it: the server holds the request and
+      // answers the instant a caption lands, so the idle tick stops being
+      // part of what a listener waits through. Never on a cold cursor (there
+      // is already something to send) and never while hidden.
+      const wait = !!(S.tier && S.tier.longPoll) && S.cursor > 0 && !document.hidden;
+      const requestedAt = Date.now();
+      const data = await api(
+        `/api/rooms/${S.route.code}/stream?since=${S.cursor}${wait ? '&wait=1' : ''}`
+      );
+      const receivedAt = Date.now();
       if (data.notFound) {
         S.error = 'not_found';
         stopPolling();
@@ -1150,7 +1274,16 @@
       S.myQueuePosition = data.myQueuePosition || null;
       S.budget = data.budget || null;
       S.dialIn = data.dialIn || S.dialIn;
+      if (!S.connected) {
+        // Say it landed. A banner that only ever appears when things are
+        // broken leaves you guessing about the moment they stop being broken.
+        const queued = outbox.read().filter((i) => i.code === S.route.code).length;
+        notify(queued
+          ? `Tersambung lagi. ${queued} kalimat terkirim.`
+          : 'Tersambung lagi.');
+      }
       S.connected = true;
+      S.held = !!data.held;
       S.error = null;
 
       if (data.me) {
@@ -1179,6 +1312,8 @@
       }
       S.cursor = data.seq;
       if (data.seq !== before) S.lastChangeAt = Date.now();
+
+      noteDelivery(data.events, requestedAt, receivedAt);
 
       // Play new captions out loud. Stage 3 (one-way rooms) restricts this to
       // the people who actually hold the floor; Stage 4 (two-way) plays
@@ -1216,12 +1351,58 @@
         return;
       }
       S.connected = false;
+      S.held = false;
       if (S.room) renderRoom();
+    }
+  }
+
+  // --- delivery latency ----------------------------------------------------
+  // The third leg. The server tells us how old a caption was when it wrote the
+  // response (ageMs, measured entirely on its own clock); we add only the time
+  // the response spent in flight and on our own render path. Nothing here is a
+  // timestamp, so the two clocks never have to agree.
+  function noteDelivery(events, requestedAt, receivedAt) {
+    if (!Array.isArray(events) || !events.length) return;
+    const renderedAt = Date.now();
+    for (const ev of events) {
+      if (!ev || ev.type !== 'translation.final') continue;
+      if (ev.targetLang !== S.hearsLang) continue;
+      if (typeof ev.ageMs !== 'number') continue;
+      const key = `${ev.utteranceId}:${ev.targetLang}`;
+      if (S.latency.sampled.has(key)) continue;
+      S.latency.sampled.add(key);
+      const deliverMs = Math.max(0, Math.round(ev.ageMs + (renderedAt - receivedAt)));
+      S.latency.pending.push({
+        utteranceId: ev.utteranceId, targetLang: ev.targetLang, deliverMs,
+      });
+      S.latency.recent.push({ deliverMs, at: renderedAt });
+      if (S.latency.recent.length > 20) S.latency.recent.shift();
+    }
+    // A held request that waited eight seconds for nothing is not a slow
+    // caption; requestedAt is kept so that stays visible while debugging.
+    void requestedAt;
+    flushLatency();
+  }
+
+  async function flushLatency() {
+    const cfg = (S.config && S.config.latency) || {};
+    const every = cfg.DELIVER_BATCH_MS || 10000;
+    if (!S.latency.pending.length) return;
+    if (Date.now() - S.latency.lastSentAt < every) return;
+    const samples = S.latency.pending.splice(0, cfg.MAX_SAMPLES_PER_BATCH || 20);
+    S.latency.lastSentAt = Date.now();
+    try {
+      await api(`/api/rooms/${S.route.code}/latency`, { method: 'POST', body: { samples } });
+    } catch {
+      // Telemetry. Dropping a batch is the correct failure, not a retry loop.
     }
   }
 
   function pollDelay() {
     const limits = (S.config && S.config.limits) || {};
+    // The previous request was held open, so the server is already doing the
+    // waiting. Come straight back rather than sleeping a second time.
+    if (S.held) return 150;
     const idleAfter = limits.POLL_IDLE_AFTER_MS || 45000;
     if (Date.now() - S.lastChangeAt > idleAfter) return limits.POLL_IDLE_MS || 2500;
     // A large room polls slower on purpose: two hundred tabs at 900ms is a
@@ -1334,6 +1515,9 @@
         <span class="text-sm font-mono">${esc(value)}</span>
         ${hint ? `<span class="text-[11px] text-zinc-600">${esc(hint)}</span>` : ''}
       </div>`;
+    const e2e = (m.endToEnd && m.endToEnd.overall) || {};
+    const e2eTiers = (m.endToEnd && m.endToEnd.byTier) || [];
+    const ms = (v) => (v == null ? '—' : `${Math.round(v)} ms`);
     const maxU = Math.max(1, ...(m.daily || []).map((d) => d.utterances));
     appEl().innerHTML = `
       ${header('Service metrics', { back: '/' })}
@@ -1347,6 +1531,29 @@
           ${row('captions produced', l.n || 0)}
           ${row('failed', l.errors || 0)}
           ${row('unavailable', l.unavailable || 0)}
+        </section>
+
+        <section id="end-to-end" class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Ujung ke ujung (7 hari)</h2>
+          <p class="text-[11px] text-zinc-600 px-1">
+            Tiga bagian dari satu kalimat: waktu bicara sampai selesai, waktu terjemahan,
+            dan waktu sampai teks tampil di layar pendengar.
+          </p>
+          ${e2e.n
+            ? `
+              ${row('Total p50', ms(e2e.total_p50), `${e2e.n} sampel`)}
+              ${row('Total p95', ms(e2e.total_p95))}
+              ${row('Bicara p50 / p95', `${ms(e2e.capture_p50)} / ${ms(e2e.capture_p95)}`, 'mikrofon')}
+              ${row('Terjemah p50 / p95', `${ms(e2e.translate_p50)} / ${ms(e2e.translate_p95)}`, 'proxy')}
+              ${row('Kirim p50 / p95', `${ms(e2e.deliver_p50)} / ${ms(e2e.deliver_p95)}`, 'ke layar')}
+              ${(e2eTiers.length
+                ? e2eTiers.map((t) => row(
+                  tierLabel(t.tier),
+                  `${ms(t.total_p50)} / ${ms(t.total_p95)}`,
+                  `${t.n} sampel`
+                )).join('')
+                : '')}`
+            : '<p class="text-sm text-zinc-600">Belum ada sampel ujung ke ujung pada rentang ini.</p>'}
         </section>
 
         <section class="space-y-1.5">
@@ -1391,6 +1598,7 @@
           ${row('open calls', (m.live && m.live.open_rooms) || 0)}
           ${row('people in a call', (m.live && m.live.live_participants) || 0)}
           ${row('translation service', m.llmEnabled ? 'available' : 'unavailable here')}
+          ${row('speaker sessions held', m.translationSessions || 0, 'per speaker, per pair')}
         </section>
 
         <section class="space-y-1.5">
