@@ -75,6 +75,31 @@
       "name": "A caption with no row for your language says so",
       "path": "/room/DEMOTEAM",
       "expectSelector": "#feed .utterance .translation.missing"
+    },
+    {
+      "name": "Listening mode selector offers all three modes",
+      "path": "/room/DEMOSUP",
+      "expectSelector": "#audio-mode [data-audio-mode=\"both\"]"
+    },
+    {
+      "name": "Language sheet carries the listening modes",
+      "path": "/room/DEMOSUP?screen=languages",
+      "expectSelector": "#audio-mode-sheet"
+    },
+    {
+      "name": "A caption that cannot be spoken says so",
+      "path": "/room/DEMOTEAM",
+      "expectSelector": "#feed .utterance .audio-fallback"
+    },
+    {
+      "name": "Audio bus demo panel renders",
+      "path": "/room/DEMOSUP?audio=demo",
+      "expectSelector": "#audio-demo"
+    },
+    {
+      "name": "Metrics reports the audio leg",
+      "path": "/admin/metrics",
+      "expectText": "Jalur suara"
     }
   ]
 }

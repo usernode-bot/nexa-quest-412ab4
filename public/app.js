@@ -59,7 +59,7 @@
   // --- state ---------------------------------------------------------------
   const S = {
     config: null,
-    prefs: { speaksLang: 'en', hearsLang: 'en', ttsEnabled: true, isDefault: true },
+    prefs: { speaksLang: 'en', hearsLang: 'en', audioMode: 'both', ttsEnabled: true, isDefault: true },
     route: null,
     room: null,
     me: null,
@@ -96,10 +96,18 @@
     langSwitchedAt: 0,
     backfilling: 0,
     // Delivery-latency samples measured in this tab, batched to the server.
-    latency: { pending: [], recent: [], lastSentAt: 0, sampled: new Set() },
+    latency: { pending: [], recent: [], lastSentAt: 0, sampled: new Set(), byKey: new Map() },
+    // Sealed clauses already handed to the audio bus, so a caption that is
+    // still streaming is offered once per new clause and never re-offered.
+    offeredSegments: new Map(),
+    audioDemo: false,
+    // What the listener was hearing before they muted, so the quick toggle
+    // puts them back where they were instead of guessing a default.
+    lastHeardMode: null,
     // Did the last /stream call hold the connection open, and is it worth
     // asking it to. Server decides; this is only what it last answered.
     held: false,
+    restTick: false,
   };
 
   // The room's tier, with a shape that is safe to read before the first poll
@@ -215,13 +223,23 @@
             ${langs.map((l) => option(l, 'hearsLang', S.prefs.hearsLang === l.code)).join('')}
           </div>
 
-          <label class="flex items-center justify-between gap-3 px-3 py-3 rounded-xl bg-zinc-900 mb-4">
-            <span class="min-w-0">
-              <span class="block text-sm">Speak translations out loud</span>
-              <span class="block text-xs text-zinc-500">Off means subtitles only.</span>
-            </span>
-            <input type="checkbox" id="tts-toggle" class="un-switch" ${S.prefs.ttsEnabled ? 'checked' : ''}>
-          </label>
+          <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">What I hear</h3>
+          <div id="audio-mode-sheet" data-mode="${esc(audioMode())}" class="grid gap-1.5 mb-5">
+            ${(((S.config && S.config.audio) || {}).MODES || ['translation', 'original', 'both']).map((m) => {
+              const c = AUDIO_MODE_COPY[m] || { icon: '🔈', label: m, hint: '' };
+              const on = m === audioMode();
+              return `
+                <button data-audio-mode-pick="${esc(m)}" aria-pressed="${on ? 'true' : 'false'}"
+                        class="un-pressable w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left ${on ? 'bg-violet-600/20 ring-1 ring-violet-500' : 'bg-zinc-900'}">
+                  <span class="text-lg">${c.icon}</span>
+                  <span class="flex-1 min-w-0">
+                    <span class="block text-sm truncate">${esc(c.label)}</span>
+                    <span class="block text-xs text-zinc-500 truncate">${esc(c.hint)}</span>
+                  </span>
+                  ${on ? '<span class="text-violet-400 text-sm">✓</span>' : ''}
+                </button>`;
+            }).join('')}
+          </div>
 
           ${soon.length ? `
             <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">Coming soon</h3>
@@ -247,8 +265,16 @@
       render();
     };
     overlay.querySelector('[data-close-sheet]').addEventListener('click', closeSheet);
-    overlay.querySelector('#tts-toggle').addEventListener('change', (e) => {
-      S.prefs.ttsEnabled = e.target.checked;
+    overlay.querySelectorAll('[data-audio-mode-pick]').forEach((b) => {
+      b.addEventListener('click', () => {
+        // Applied to the bus straight away so the change is audible before the
+        // sheet is saved; the save is what makes it survive a reload.
+        S.prefs.audioMode = b.dataset.audioModePick;
+        S.prefs.ttsEnabled = S.prefs.audioMode !== 'original';
+        const bus = ensureAudio();
+        if (bus) bus.setMode(S.prefs.audioMode);
+        renderLanguageSheet();
+      });
     });
     overlay.querySelector('#lang-save').addEventListener('click', async () => {
       const hadHears = S.hearsLang;
@@ -258,7 +284,11 @@
         if (S.route && S.route.name === 'room' && S.isMember) {
           const patched = await api(`/api/rooms/${S.route.code}/me`, {
             method: 'PATCH',
-            body: { speaksLang: S.prefs.speaksLang, hearsLang: S.prefs.hearsLang, ttsEnabled: S.prefs.ttsEnabled },
+            body: {
+              speaksLang: S.prefs.speaksLang,
+              hearsLang: S.prefs.hearsLang,
+              audioMode: S.prefs.audioMode,
+            },
           });
           if (S.prefs.hearsLang !== hadHears) {
             // Everything already on screen was said for the old language. Mark
@@ -266,6 +296,9 @@
             // instead of looking like it is still loading.
             S.langSwitchedAt = Date.now();
             S.latency.sampled.clear();
+            S.latency.byKey.clear();
+            S.offeredSegments.clear();
+            if (Audio) Audio.reset();
             S.backfilling = patched.backfilling || 0;
             if (S.backfilling) {
               notify(`Bahasa diganti. ${S.backfilling} kalimat terakhir sedang diterjemahkan ulang.`);
@@ -592,6 +625,240 @@
     },
   };
 
+
+  // --- audio bus -----------------------------------------------------------
+  // Slice 2. The listener hears the translation on their own device: the
+  // server seals immutable clauses out of the streaming caption, and the bus
+  // speaks clause 1 while clause 2 is still being written. Nothing here sends
+  // or receives audio over the network.
+  //
+  // `Voice` above stays as the one-shot path used outside a room (and by the
+  // demo panel); inside a room every spoken word goes through the bus so the
+  // queue caps, the ducking and the fallback budget apply.
+  let Audio = null;
+
+  function audioCfg() {
+    return (S.config && S.config.audio) || {};
+  }
+
+  function audioMode() {
+    const modes = audioCfg().MODES || ['translation', 'original', 'both'];
+    const want = S.prefs.audioMode;
+    if (modes.indexOf(want) >= 0) return want;
+    return audioCfg().DEFAULT_MODE || 'both';
+  }
+
+  function ensureAudio() {
+    if (Audio || !window.LTAudio) return Audio;
+    Audio = window.LTAudio.createAudioBus({
+      config: audioCfg(),
+      on: {
+        spoken: (ev) => noteAudioLeg(ev.utteranceId, ev.targetLang, ev.audioMs, 'spoken'),
+        fallback: (ev) => {
+          noteAudioLeg(ev.utteranceId, ev.targetLang, null, 'fallback');
+          scheduleAudioRender();
+        },
+        change: () => refreshAudioPanel(),
+      },
+    });
+    // The microphone is a duck sink with a floor of zero: while a translation
+    // is being spoken the recogniser is off, which is exactly the Stage 4 echo
+    // suppression rule, now expressed once for every sink instead of inline.
+    Audio.registerSink('microphone', 0, (gain) => {
+      if (gain < 1) Speech.suppress(); else Speech.resume();
+    });
+    Audio.setMode(audioMode());
+    return Audio;
+  }
+
+  let audioRenderQueued = false;
+  function scheduleAudioRender() {
+    if (audioRenderQueued) return;
+    audioRenderQueued = true;
+    setTimeout(() => {
+      audioRenderQueued = false;
+      if (S.route && S.route.name === 'room' && S.room) renderRoom();
+    }, 80);
+  }
+
+  // The bus changes state far more often than a caption arrives (every clause
+  // start and end), so a full re-render would fight the composer for focus.
+  // Only the demo panel reads the live numbers, so only it is refreshed.
+  function refreshAudioPanel() {
+    const el = document.getElementById('audio-demo-state');
+    if (!el || !Audio) return;
+    el.textContent = audioDemoLine(Audio.state());
+  }
+
+  // Push a caption's sealed clauses at the bus. Called for streaming captions
+  // (partial, sealed prefix only) and again when the caption finishes; the bus
+  // dedupes by segment index, so the same clause is never spoken twice.
+  function offerAudio(u, tr, final) {
+    if (!tr || !Audio || !S.room || S.room.endedAt) return;
+    if (S.suppressTts) return;
+    if (S.me && u && u.speakerUserId === S.me.userId) return;
+    if (u && !S.room.twoWay) {
+      const speaker = S.participants.get(u.speakerUserId);
+      if (speaker && speaker.role === 'audience') return;
+    }
+    const segments = Array.isArray(tr.segments) && tr.segments.length
+      ? tr.segments
+      : (final && tr.text ? [tr.text] : []);
+    const sealedIdx = Array.isArray(tr.segments) && tr.segments.length
+      ? Math.min(Number(tr.sealedIdx || tr.segments.length), tr.segments.length)
+      : segments.length;
+    if (!sealedIdx) return;
+    Audio.offer({
+      utteranceId: tr.utteranceId != null ? tr.utteranceId : (u && u.id),
+      targetLang: tr.targetLang || S.hearsLang,
+      ttsTag: langOf(tr.targetLang || S.hearsLang).tts,
+      segments,
+      sealedIdx,
+      final: !!final,
+      ageMs: Number.isFinite(Number(tr.audioAgeMs)) ? Number(tr.audioAgeMs) : 0,
+    });
+  }
+
+  // Sealed clauses of a caption that is STILL STREAMING. Deliberately does not
+  // touch S.spokenIds: that set means "this whole utterance has been handled",
+  // and marking a partial there would let the finished caption be skipped, and
+  // would trip the no-tts-for-partial-captions invariant besides.
+  function noteSegments(events) {
+    if (!Array.isArray(events) || !events.length || !Audio) return;
+    for (const ev of events) {
+      if (!ev || ev.type !== 'translation.segment') continue;
+      if (ev.targetLang !== S.hearsLang) continue;
+      if (ev.final) continue; // the finished caption goes through the fresh path
+      const u = S.utterances.get(ev.utteranceId);
+      if (!u || u.retracted) continue;
+      const key = `${ev.utteranceId}:${ev.targetLang}`;
+      const had = S.offeredSegments.get(key) || 0;
+      if (ev.sealedIdx <= had) continue;
+      S.offeredSegments.set(key, ev.sealedIdx);
+      offerAudio(u, {
+        utteranceId: ev.utteranceId,
+        targetLang: ev.targetLang,
+        segments: ev.segments,
+        sealedIdx: ev.sealedIdx,
+        audioAgeMs: ev.audioAgeMs,
+      }, false);
+    }
+  }
+
+  // The fourth latency leg. The bus reports the time from "the clause was on
+  // screen" to "the synthesiser actually started", added to the server's own
+  // age for the clause. Attached to the delivery sample that is already
+  // waiting to be sent, so no extra request exists for it.
+  function noteAudioLeg(utteranceId, targetLang, audioMs, outcome) {
+    const sample = S.latency.byKey.get(`${utteranceId}:${targetLang}`);
+    if (!sample) return;
+    if (audioMs != null && sample.audioMs == null) sample.audioMs = audioMs;
+    if (!sample.audioOutcome || outcome === 'spoken') sample.audioOutcome = outcome;
+  }
+
+  async function setAudioMode(next) {
+    const bus = ensureAudio();
+    S.prefs.audioMode = next;
+    S.prefs.ttsEnabled = next !== 'original';
+    if (bus) bus.setMode(next);
+    try {
+      await api('/api/me/prefs', { method: 'PUT', body: S.prefs });
+    } catch { /* the local choice still applies for this tab */ }
+    if (S.route && S.route.name === 'room' && S.isMember) {
+      try {
+        await api(`/api/rooms/${S.route.code}/me`, { method: 'PATCH', body: { audioMode: next } });
+      } catch { /* the room row catches up on the next save */ }
+    }
+  }
+
+  const AUDIO_MODE_COPY = {
+    translation: { icon: '🔊', label: 'Terjemahan', hint: 'Hanya suara terjemahan.' },
+    original: { icon: '📝', label: 'Asli', hint: 'Teks saja, tidak ada suara.' },
+    both: { icon: '🎧', label: 'Keduanya', hint: 'Ruangan pelan di bawah terjemahan.' },
+  };
+
+  // The three-mode selector. Rendered for members AND for someone reading the
+  // room without having joined: choosing whether to be read to is a listener's
+  // choice, and a non-member is a listener.
+  function audioModeHTML(id) {
+    const modes = audioCfg().MODES || ['translation', 'original', 'both'];
+    const cur = audioMode();
+    const st = Audio ? Audio.state() : null;
+    let note = '';
+    if (st && !st.supported) {
+      note = 'Peramban ini tidak bisa membacakan teks, jadi terjemahan tampil sebagai teks saja.';
+    } else if (st && st.disabled) {
+      note = 'Suara dimatikan sementara karena beberapa kalimat gagal dibacakan. Teksnya tetap lengkap.';
+    } else if (cur === 'both') {
+      note = 'Anda mendengar ruangan pelan di bawah suara terjemahan.';
+    } else if (cur === 'original') {
+      note = 'Tidak ada suara terjemahan. Semua tetap tampil sebagai teks.';
+    } else {
+      note = 'Anda hanya mendengar suara terjemahan.';
+    }
+    return `
+      <div id="${esc(id)}" data-mode="${esc(cur)}" class="p-3 rounded-xl bg-zinc-900 space-y-2">
+        <div class="flex items-center gap-2">
+          <span class="text-xs uppercase tracking-wide text-zinc-500">Yang Anda dengar</span>
+          <span class="flex-1"></span>
+          ${st && st.speaking ? '<span class="text-[11px] text-emerald-400">membacakan…</span>' : ''}
+        </div>
+        <div class="grid grid-cols-3 gap-1.5">
+          ${modes.map((m) => {
+            const c = AUDIO_MODE_COPY[m] || { icon: '🔈', label: m, hint: '' };
+            const on = m === cur;
+            return `
+              <button data-audio-mode="${esc(m)}" aria-pressed="${on ? 'true' : 'false'}"
+                      class="un-pressable flex flex-col items-center gap-0.5 py-2 rounded-lg text-xs ${on ? 'bg-violet-600/20 ring-1 ring-violet-500 text-violet-200' : 'bg-zinc-800 text-zinc-400'}">
+                <span class="text-base">${c.icon}</span>
+                <span>${esc(c.label)}</span>
+              </button>`;
+          }).join('')}
+        </div>
+        <p class="text-[11px] text-zinc-600">${esc(note)}</p>
+      </div>`;
+  }
+
+  function audioDemoLine(st) {
+    if (!st) return 'Audio bus belum siap.';
+    return [
+      `mode ${st.mode}`,
+      `suara ${st.voices}`,
+      `antre ${st.queuedSegments}/${st.queuedUtterances}`,
+      st.speaking ? 'membacakan' : 'diam',
+      st.ducked ? 'diredam' : 'normal',
+      `sink ${st.sinks}`,
+      `teks ${st.fallbacks}`,
+      `laju ${st.rate}`,
+    ].join(' · ');
+  }
+
+  // `?audio=demo` is pure client state and writes nothing, so it renders in
+  // BOTH environments: the "before" screenshot is taken from production, and a
+  // panel that only existed in staging would never get one. It also renders on
+  // a device with no synthesiser at all, saying so, which is what makes it
+  // checkable headlessly.
+  function audioDemoHTML() {
+    if (!S.audioDemo) return '';
+    const st = Audio ? Audio.state() : null;
+    return `
+      <section id="audio-demo" class="p-3 rounded-xl bg-zinc-900 ring-1 ring-violet-600/30 space-y-2">
+        <h3 class="text-xs uppercase tracking-wide text-violet-300">Audio bus</h3>
+        <p class="text-[11px] text-zinc-500">
+          Panel diagnostik. Menunjukkan apa yang sedang dibacakan, berapa klausa yang mengantre,
+          dan apakah suara ruangan sedang diredam.
+        </p>
+        <p id="audio-demo-state" class="text-[11px] font-mono text-zinc-400 break-words">${esc(audioDemoLine(st))}</p>
+        <div class="flex gap-2">
+          <button id="audio-demo-say" class="un-pressable flex-1 py-2 rounded-lg bg-zinc-800 text-xs">Coba satu kalimat</button>
+          <button id="audio-demo-stop" class="un-pressable flex-1 py-2 rounded-lg bg-zinc-800 text-xs">Hentikan suara</button>
+        </div>
+        ${st && !st.supported
+          ? '<p class="text-[11px] text-amber-400/80">Perangkat ini tidak punya penyintesis suara, jadi semuanya tetap tampil sebagai teks.</p>'
+          : ''}
+      </section>`;
+  }
+
   function setInterim(text) {
     const el = document.getElementById('interim');
     if (!el) return;
@@ -620,6 +887,23 @@
     return Date.now() - at > grace;
   }
 
+  // A caption that was meant to be spoken but never was. Two ways to know:
+  // the bus told us the synthesiser refused or never started, or the sealed
+  // clause is older than the whole audio budget and no voice ever claimed it.
+  // Either way the listener is reading it, and saying so beats silence they
+  // cannot explain.
+  function audioFellBack(u, tr) {
+    if (!tr || tr.status !== 'ok') return false;
+    if (audioMode() === 'original') return false;
+    if (u.sourceLang === tr.targetLang) return false;
+    if (Audio && Audio.isFallback(u.id, tr.targetLang)) return true;
+    if (Audio && !Audio.state().supported) return false;
+    const stale = audioCfg().STALE_MS || 12000;
+    const age = Number(tr.audioAgeMs);
+    const sealed = Array.isArray(tr.segments) && tr.segments.length;
+    return !!sealed && Number.isFinite(age) && age > stale && !S.spokenIds.has(u.id);
+  }
+
   function utteranceHTML(u) {
     const mine = S.me && u.speakerUserId === S.me.userId;
     const target = S.hearsLang;
@@ -634,6 +918,9 @@
         <p class="text-xs text-zinc-600 mt-1">Already in your language</p>`;
     } else if (tr && tr.status === 'ok') {
       translationBlock = `<p class="translation text-sm text-zinc-100">${esc(tr.text)}</p>
+        ${audioFellBack(u, tr)
+          ? '<p class="audio-fallback text-[11px] text-amber-400/80 mt-1">Tidak bisa dibacakan di perangkat ini. Teksnya lengkap di atas.</p>'
+          : ''}
         ${tr.latencyMs != null ? `<p class="text-[11px] text-zinc-700 mt-1">${tr.latencyMs} ms</p>` : ''}`;
     } else if (tr && tr.status === 'partial') {
       // The caption is still being generated. Shown dim and provisional, and
@@ -956,6 +1243,10 @@
 
         ${floorHTML()}
 
+        ${audioModeHTML('audio-mode')}
+
+        ${audioDemoHTML()}
+
         <div id="feed" class="space-y-2 max-h-[52vh] overflow-y-auto pr-1">
           ${utterances.length
             ? utterances.map(utteranceHTML).join('')
@@ -1060,11 +1351,48 @@
       });
     }
 
+    appEl().querySelectorAll('#audio-mode [data-audio-mode]').forEach((b) => {
+      b.addEventListener('click', async () => {
+        await setAudioMode(b.dataset.audioMode);
+        renderRoom();
+      });
+    });
+
+    if (el('audio-demo-say')) {
+      el('audio-demo-say').addEventListener('click', () => {
+        const bus = ensureAudio();
+        if (!bus) return;
+        // Offered through the bus rather than spoken directly, so the panel
+        // exercises the real path: sealed clauses, queue caps and ducking.
+        bus.offer({
+          utteranceId: -1,
+          targetLang: S.hearsLang,
+          ttsTag: langOf(S.hearsLang).tts,
+          segments: ['Ini contoh suara terjemahan. ', 'Klausa kedua dibacakan setelahnya.'],
+          sealedIdx: 2,
+          final: true,
+          ageMs: 0,
+        });
+        refreshAudioPanel();
+      });
+    }
+    if (el('audio-demo-stop')) {
+      el('audio-demo-stop').addEventListener('click', () => {
+        if (Audio) Audio.reset();
+        Voice.clear();
+        refreshAudioPanel();
+      });
+    }
+
     if (el('tts-quick')) {
       el('tts-quick').addEventListener('click', async () => {
-        S.prefs.ttsEnabled = !S.prefs.ttsEnabled;
-        if (!S.prefs.ttsEnabled) Voice.clear();
-        try { await api('/api/me/prefs', { method: 'PUT', body: S.prefs }); } catch { /* local toggle still applies */ }
+        const next = audioMode() === 'original'
+          ? (S.lastHeardMode || audioCfg().DEFAULT_MODE || 'both')
+          : 'original';
+        if (next === 'original') S.lastHeardMode = audioMode();
+        if (Audio) Audio.clear();
+        Voice.clear();
+        await setAudioMode(next);
         renderRoom();
       });
     }
@@ -1237,18 +1565,25 @@
         }
       }
     }
-    await poll();
+    // Answer now, not in eight seconds: everything after this in render() is
+    // waiting on it, so this one catch-up poll never holds.
+    await poll({ hold: false });
   }
 
   // --- the poll loop -------------------------------------------------------
-  async function poll() {
+  async function poll(opts) {
     if (!S.route || S.route.name !== 'room') return;
     try {
       // Long poll where the tier allows it: the server holds the request and
       // answers the instant a caption lands, so the idle tick stops being
       // part of what a listener waits through. Never on a cold cursor (there
       // is already something to send) and never while hidden.
-      const wait = !!(S.tier && S.tier.longPoll) && S.cursor > 0 && !document.hidden;
+      // A hold that expired with nothing to send earns one plain tick before
+      // the next one. It costs a silent room about a second of the long-poll
+      // win, and it means a listener's tab is never holding a socket open
+      // without pause, which is what a quiet room would otherwise do forever.
+      const mayHold = !(opts && opts.hold === false);
+      const wait = mayHold && !!(S.tier && S.tier.longPoll) && S.cursor > 0 && !document.hidden && !S.restTick;
       const requestedAt = Date.now();
       const data = await api(
         `/api/rooms/${S.route.code}/stream?since=${S.cursor}${wait ? '&wait=1' : ''}`
@@ -1284,6 +1619,7 @@
       }
       S.connected = true;
       S.held = !!data.held;
+      S.restTick = !!data.held;
       S.error = null;
 
       if (data.me) {
@@ -1314,6 +1650,9 @@
       if (data.seq !== before) S.lastChangeAt = Date.now();
 
       noteDelivery(data.events, requestedAt, receivedAt);
+      // Sealed clauses of captions still being written. This is the whole
+      // latency win: clause 1 is spoken while clause 2 is still arriving.
+      if (S.room && !S.room.endedAt) noteSegments(data.events);
 
       // Play new captions out loud. Stage 3 (one-way rooms) restricts this to
       // the people who actually hold the floor; Stage 4 (two-way) plays
@@ -1325,20 +1664,24 @@
           // already on screen while the tab was hidden is never read out
           // minutes late when the tab comes back.
           S.spokenIds.add(u.id);
-          if (!S.prefs.ttsEnabled || S.suppressTts) continue;
-          if (S.me && u.speakerUserId === S.me.userId) continue;
-          const speaker = S.participants.get(u.speakerUserId);
-          if (!S.room.twoWay && speaker && speaker.role === 'audience') continue;
+          if (S.suppressTts) continue;
           const tr = (u.translations || []).find((t) => t.targetLang === S.hearsLang);
-          // Only a FINISHED caption is spoken. A partial is provisional text
-          // that is about to be replaced — see utteranceHTML.
-          if (tr && tr.status === 'ok') Voice.say(tr.text, S.hearsLang);
+          // Only SEALED text is spoken. A sealed clause is immutable, which is
+          // what lets the voice start before the sentence is finished; an
+          // unsealed tail is provisional and is never offered. The bus applies
+          // the listening mode, dedupes clauses it already spoke while the
+          // caption was streaming, and drops the rest of the guards.
+          if (tr && tr.status === 'ok') offerAudio(u, tr, true);
         }
       }
       S.suppressTts = false;
+      // An utterance that was offered but never got a voice degrades to text
+      // here rather than sitting silent forever.
+      if (Audio) Audio.sweep();
 
       if (S.room.endedAt && S.route.name === 'room') {
         Speech.stop(); Voice.clear();
+        if (Audio) Audio.reset();
         navigate(`/room/${S.route.code}/ended`, { transition: 'pop' });
         return;
       }
@@ -1352,6 +1695,7 @@
       }
       S.connected = false;
       S.held = false;
+      S.restTick = false;
       if (S.room) renderRoom();
     }
   }
@@ -1372,9 +1716,11 @@
       if (S.latency.sampled.has(key)) continue;
       S.latency.sampled.add(key);
       const deliverMs = Math.max(0, Math.round(ev.ageMs + (renderedAt - receivedAt)));
-      S.latency.pending.push({
-        utteranceId: ev.utteranceId, targetLang: ev.targetLang, deliverMs,
-      });
+      const sample = { utteranceId: ev.utteranceId, targetLang: ev.targetLang, deliverMs };
+      S.latency.pending.push(sample);
+      // The audio leg lands later (the synthesiser has to actually start), so
+      // the sample stays reachable by key until the batch is sent.
+      S.latency.byKey.set(key, sample);
       S.latency.recent.push({ deliverMs, at: renderedAt });
       if (S.latency.recent.length > 20) S.latency.recent.shift();
     }
@@ -1390,6 +1736,7 @@
     if (!S.latency.pending.length) return;
     if (Date.now() - S.latency.lastSentAt < every) return;
     const samples = S.latency.pending.splice(0, cfg.MAX_SAMPLES_PER_BATCH || 20);
+    for (const smp of samples) S.latency.byKey.delete(`${smp.utteranceId}:${smp.targetLang}`);
     S.latency.lastSentAt = Date.now();
     try {
       await api(`/api/rooms/${S.route.code}/latency`, { method: 'POST', body: { samples } });
@@ -1556,6 +1903,23 @@
             : '<p class="text-sm text-zinc-600">Belum ada sampel ujung ke ujung pada rentang ini.</p>'}
         </section>
 
+        <section id="audio-leg" class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Jalur suara (7 hari)</h2>
+          <p class="text-[11px] text-zinc-600 px-1">
+            Bagian keempat: dari klausa tampil di layar sampai suara terjemahan benar benar mulai
+            dibacakan di perangkat pendengar. Hanya kalimat yang memang berbunyi yang dihitung,
+            jadi pendengar yang sengaja membaca saja tidak ikut menurunkan angkanya.
+          </p>
+          ${e2e.audio_n
+            ? `
+              ${row('Suara p50', ms(e2e.audio_p50), `${e2e.audio_n} sampel`)}
+              ${row('Suara p95', ms(e2e.audio_p95))}
+              ${row('Sampai terdengar p50', ms(e2e.heard_p50), 'empat jalur')}
+              ${row('Sampai terdengar p95', ms(e2e.heard_p95), 'empat jalur')}
+              ${row('Gagal dibacakan', e2e.audio_fallbacks || 0, 'jatuh ke teks')}`
+            : '<p class="text-sm text-zinc-600">Belum ada kalimat yang dibacakan pada rentang ini.</p>'}
+        </section>
+
         <section class="space-y-1.5">
           <h2 class="text-xs uppercase tracking-wide text-zinc-500">Latency by room size (7 days)</h2>
           ${(m.byTier || []).length
@@ -1628,6 +1992,9 @@
   // --- render --------------------------------------------------------------
   async function render() {
     const route = parseRoute();
+    // `?audio=demo` is an explicit opt-in that writes nothing, so it is
+    // available in every environment rather than gated on staging.
+    S.audioDemo = new URLSearchParams(location.search).get('audio') === 'demo';
     const changedRoom = !S.route || S.route.name !== route.name || S.route.code !== route.code;
     S.route = route;
 
@@ -1635,11 +2002,22 @@
       stopPolling();
       Speech.stop();
       Voice.clear();
+      if (Audio) Audio.reset();
+      S.latency.byKey.clear();
+      S.offeredSegments.clear();
       if (route.name !== 'room') {
         S.room = null; S.me = null; S.participants.clear(); S.utterances.clear();
         S.cursor = 0; S.spokenIds.clear();
       }
     }
+
+    // The `?screen=languages` deep link is pure client state, so it opens
+    // before the route does its own network work rather than behind it. A
+    // /stream request held open for eight seconds must never be the thing a
+    // deep-linked sheet is waiting on.
+    const sheetOpen = new URLSearchParams(location.search).get('screen') === 'languages';
+    if (sheetOpen) renderLanguageSheet();
+    else document.getElementById('overlay').innerHTML = '';
 
     if (route.name === 'lobby') {
       await renderLobby();
@@ -1660,13 +2038,12 @@
       await renderMetrics();
     }
 
-    // The `?screen=languages` deep link is pure UI state — no writes — so it
-    // works identically in production, which is where the "before"
-    // screenshot of any change to this sheet gets taken.
-    if (new URLSearchParams(location.search).get('screen') === 'languages') {
+    // Re-render it once the route has landed: poll() may have corrected the
+    // language pair from the room row, and the sheet must not show a stale
+    // pair. Deep linking works identically in production, which is where the
+    // "before" screenshot of this sheet gets taken.
+    if (sheetOpen && new URLSearchParams(location.search).get('screen') === 'languages') {
       renderLanguageSheet();
-    } else {
-      document.getElementById('overlay').innerHTML = '';
     }
   }
 
@@ -1682,6 +2059,9 @@
       S.prefs = r.prefs;
       S.hearsLang = r.prefs.hearsLang;
     } catch { /* the defaults above are fine */ }
+    // The bus needs S.config.audio, so it is built after the config lands and
+    // before anything can render a mode selector against it.
+    ensureAudio();
 
     // Ask the platform for the user's language preference only when they
     // have not made a choice inside this app. Their in-app choice wins.
@@ -1772,6 +2152,48 @@
         }
         return true;
       });
+
+      // The whole safety rule of Slice 2 in one line: a segment that is not
+      // sealed can still be rewritten, so it must never reach a speaker. The
+      // bus counts every time it was offered more than the server sent.
+      window.usernode.invariants.register('no-audio-for-unsealed-segments', function () {
+        if (!Audio) return true;
+        const st = Audio.state();
+        if (st.unsealedBlocked > 0) {
+          return `${st.unsealedBlocked} unsealed segment(s) were offered for speech`;
+        }
+        return true;
+      });
+
+      // Ducking that is never released is the failure nobody reports: the
+      // room stays quiet, or the microphone stays off, and it looks like the
+      // call died. Idle and ducked at the same time is always a bug.
+      window.usernode.invariants.register('duck-released-when-idle', function () {
+        if (!Audio) return true;
+        const st = Audio.state();
+        if (st.ducked && !st.speaking && st.queuedSegments === 0) {
+          return 'audio is ducked while nothing is being spoken';
+        }
+        return true;
+      });
+
+      // Falling behind is a worse failure than skipping, so the queue is
+      // bounded on both axes. Over the cap means trim() stopped working and
+      // the voice is drifting away from the screen.
+      window.usernode.invariants.register('audio-queue-within-caps', function () {
+        if (!Audio) return true;
+        const cfg = audioCfg();
+        const st = Audio.state();
+        const maxSeg = cfg.MAX_QUEUE_SEGMENTS || 8;
+        const maxUtt = cfg.MAX_QUEUE_UTTERANCES || 3;
+        if (st.queuedSegments > maxSeg) {
+          return `${st.queuedSegments} clauses queued, cap is ${maxSeg}`;
+        }
+        if (st.queuedUtterances > maxUtt) {
+          return `${st.queuedUtterances} captions queued, cap is ${maxUtt}`;
+        }
+        return true;
+      });
     }
 
     // Opt-in debug snapshot for filed issues. Deliberately carries NO
@@ -1805,6 +2227,18 @@
           listening: Speech.wantListening,
           sttSupported: Speech.supported(),
           ttsSupported: !!window.speechSynthesis,
+          // Audio bus. Counters and states only, never a clause of text.
+          audioMode: audioMode(),
+          audioSupported: !!(Audio && Audio.state().supported),
+          audioDisabled: !!(Audio && Audio.state().disabled),
+          audioVoices: Audio ? Audio.state().voices : 0,
+          audioQueuedSegments: Audio ? Audio.state().queuedSegments : 0,
+          audioQueuedUtterances: Audio ? Audio.state().queuedUtterances : 0,
+          audioSpeaking: !!(Audio && Audio.state().speaking),
+          audioDucked: !!(Audio && Audio.state().ducked),
+          audioSinks: Audio ? Audio.state().sinks : 0,
+          audioFallbacks: Audio ? Audio.state().fallbacks : 0,
+          audioLastOutcome: Audio ? Audio.state().lastOutcome : null,
           llmEnabled: !!(S.config && S.config.llmEnabled),
           outboxPending: outbox.read().length,
         };
@@ -1814,6 +2248,10 @@
     await render();
   }
 
-  window.addEventListener('beforeunload', () => { Speech.stop(); Voice.clear(); });
+  window.addEventListener('beforeunload', () => {
+    Speech.stop();
+    Voice.clear();
+    if (Audio) Audio.clear();
+  });
   boot();
 })();

@@ -14,6 +14,7 @@ const langgroups = require('./lib/langgroups');
 const telephony = require('./lib/bridge/telephony');
 const stream = require('./lib/stream');
 const latencyLog = require('./lib/latency');
+const segment = require('./lib/segment');
 
 const {
   LANG_CODES, LANG_BY_CODE, PURPOSE_KEYS, LIMITS,
@@ -203,6 +204,32 @@ function publicRoom(room) {
   };
 }
 
+// A listening mode the app knows, or the default. `tts_enabled` is derived
+// from it and never set independently, so the boolean and the mode cannot
+// drift apart on the same row.
+function normAudioMode(v, fallback) {
+  const fb = CONFIG.AUDIO.MODES.includes(fallback) ? fallback : CONFIG.AUDIO.DEFAULT_MODE;
+  return CONFIG.AUDIO.MODES.includes(v) ? v : fb;
+}
+
+function ttsFromMode(mode) {
+  return normAudioMode(mode, CONFIG.AUDIO.DEFAULT_MODE) !== 'original';
+}
+
+// Older clients send `ttsEnabled` and know nothing about modes. Map that onto
+// the mode vocabulary rather than keeping two sources of truth.
+function audioModeFromBody(body, current) {
+  const b = body || {};
+  if (b.audioMode !== undefined) return normAudioMode(b.audioMode, current);
+  if (b.ttsEnabled !== undefined) {
+    if (b.ttsEnabled === false) return 'original';
+    const base = normAudioMode(current, CONFIG.AUDIO.DEFAULT_MODE);
+    if (base !== 'original') return base;
+    return CONFIG.AUDIO.DEFAULT_MODE !== 'original' ? CONFIG.AUDIO.DEFAULT_MODE : 'translation';
+  }
+  return normAudioMode(current, CONFIG.AUDIO.DEFAULT_MODE);
+}
+
 function publicParticipant(p) {
   return {
     userId: p.user_id,
@@ -212,6 +239,7 @@ function publicParticipant(p) {
     micOn: p.mic_on,
     role: p.role,
     ttsEnabled: p.tts_enabled,
+    audioMode: normAudioMode(p.audio_mode, CONFIG.AUDIO.DEFAULT_MODE),
     handRaisedAt: p.hand_raised_at,
     mutedByHost: p.muted_by_host,
     removed: p.removed,
@@ -232,6 +260,7 @@ app.get('/api/config', (_req, res) => {
     degrade: CONFIG.DEGRADE_THRESHOLDS,
     limits: LIMITS,
     latency: CONFIG.LATENCY,
+    audio: CONFIG.AUDIO,
     llmEnabled: translator.LLM_ENABLED,
     engine: translator.activeEngineId(),
     dialIn: telephony.status(),
@@ -274,6 +303,7 @@ app.get('/api/me/prefs', async (req, res) => {
         prefs: {
           speaksLang: p.speaks_lang,
           hearsLang: p.hears_lang,
+          audioMode: normAudioMode(p.audio_mode, CONFIG.AUDIO.DEFAULT_MODE),
           ttsEnabled: p.tts_enabled,
           isDefault: false,
         },
@@ -286,7 +316,13 @@ app.get('/api/me/prefs', async (req, res) => {
     const locale = String(req.user.locale || '').toLowerCase();
     const guess = LANG_CODES.find((c) => locale === c || locale.startsWith(`${c}-`)) || 'en';
     res.json({
-      prefs: { speaksLang: guess, hearsLang: guess, ttsEnabled: true, isDefault: true },
+      prefs: {
+        speaksLang: guess,
+        hearsLang: guess,
+        audioMode: CONFIG.AUDIO.DEFAULT_MODE,
+        ttsEnabled: ttsFromMode(CONFIG.AUDIO.DEFAULT_MODE),
+        isDefault: true,
+      },
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -296,18 +332,32 @@ app.get('/api/me/prefs', async (req, res) => {
 app.put('/api/me/prefs', async (req, res) => {
   const speaks = normLang(req.body && req.body.speaksLang, 'en');
   const hears = normLang(req.body && req.body.hearsLang, 'en');
-  const tts = (req.body && req.body.ttsEnabled) !== false;
   try {
+    const { rows: existing } = await pool.query(
+      'SELECT audio_mode FROM user_language_prefs WHERE user_id = $1',
+      [req.user.id]
+    );
+    const audioMode = audioModeFromBody(
+      req.body,
+      existing.length ? existing[0].audio_mode : CONFIG.AUDIO.DEFAULT_MODE
+    );
+    const tts = ttsFromMode(audioMode);
     await pool.query(
-      `INSERT INTO user_language_prefs (user_id, username, speaks_lang, hears_lang, tts_enabled, updated_at)
-       VALUES ($1,$2,$3,$4,$5,NOW())
+      `INSERT INTO user_language_prefs
+         (user_id, username, speaks_lang, hears_lang, tts_enabled, audio_mode, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,NOW())
        ON CONFLICT (user_id) DO UPDATE
          SET username = EXCLUDED.username, speaks_lang = EXCLUDED.speaks_lang,
              hears_lang = EXCLUDED.hears_lang, tts_enabled = EXCLUDED.tts_enabled,
+             audio_mode = EXCLUDED.audio_mode,
              updated_at = NOW()`,
-      [req.user.id, req.user.username, speaks, hears, tts]
+      [req.user.id, req.user.username, speaks, hears, tts, audioMode]
     );
-    res.json({ prefs: { speaksLang: speaks, hearsLang: hears, ttsEnabled: tts, isDefault: false } });
+    res.json({
+      prefs: {
+        speaksLang: speaks, hearsLang: hears, audioMode, ttsEnabled: tts, isDefault: false,
+      },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -537,7 +587,8 @@ app.patch('/api/rooms/:code/me', async (req, res) => {
     // point of the moderation control.
     let micOn = b.micOn === undefined ? me.mic_on : !!b.micOn;
     if (me.muted_by_host) micOn = false;
-    const tts = b.ttsEnabled === undefined ? me.tts_enabled : !!b.ttsEnabled;
+    const audioMode = audioModeFromBody(b, me.audio_mode);
+    const tts = ttsFromMode(audioMode);
     const hand = b.handRaised === undefined
       ? me.hand_raised_at
       : (b.handRaised ? (me.hand_raised_at || new Date()) : null);
@@ -546,9 +597,9 @@ app.patch('/api/rooms/:code/me', async (req, res) => {
     await client.query(
       `UPDATE room_participants
        SET speaks_lang=$3, hears_lang=$4, mic_on=$5, tts_enabled=$6, hand_raised_at=$7,
-           last_seen_at=NOW(), left_at=NULL, seq=$8
+           audio_mode=$9, last_seen_at=NOW(), left_at=NULL, seq=$8
        WHERE room_id=$1 AND user_id=$2`,
-      [room.id, req.user.id, speaks, hears, micOn, tts, hand, seq]
+      [room.id, req.user.id, speaks, hears, micOn, tts, hand, seq, audioMode]
     );
     await client.query('COMMIT');
 
@@ -923,16 +974,35 @@ async function translateInto(room, utterance, target, groupSize, userToken, ctx)
             [utterance.id]
           );
           const retracted = !live.length || live[0].retracted;
+
+          // Seal the rest of the caption. If the finished text no longer
+          // agrees with what was already sealed, `finalize` throws the whole
+          // segment list away and returns the caption as one segment: one
+          // honest reading beats a clever one that contradicts the screen.
+          const { rows: prevSeg } = await client.query(
+            `SELECT segments FROM utterance_translations
+              WHERE utterance_id = $1 AND target_lang = $2 FOR UPDATE`,
+            [utterance.id, target]
+          );
+          const before = prevSeg[0] && Array.isArray(prevSeg[0].segments) ? prevSeg[0].segments : [];
+          const speakable = !retracted && result.status === 'ok' && result.text;
+          const sealed = speakable
+            ? segment.finalize(before, result.text)
+            : { segments: [], reset: false };
+
           const seq = await bumpSeq(client, room.id);
           await client.query(
             `UPDATE utterance_translations
              SET text=$3, status=$4, latency_ms=$5, ttft_ms=$6, seq=$7,
-                 group_size=$8, engine_id=$9, finalized_at=NOW()
+                 group_size=$8, engine_id=$9, finalized_at=NOW(),
+                 segments=$10::jsonb, sealed_idx=$11,
+                 first_segment_at = COALESCE(first_segment_at, CASE WHEN $11 > 0 THEN NOW() END)
              WHERE utterance_id=$1 AND target_lang=$2`,
             [utterance.id, target,
               retracted ? null : result.text,
               retracted ? 'retracted' : result.status,
-              result.latencyMs, result.ttftMs, seq, groupSize, engineId]
+              result.latencyMs, result.ttftMs, seq, groupSize, engineId,
+              JSON.stringify(sealed.segments), sealed.segments.length]
           );
           await client.query('COMMIT');
         } catch (e) {
@@ -968,12 +1038,25 @@ async function writePartial(roomId, utteranceId, target, text) {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Seal whatever clauses are now complete. Sealing is append-only by
+    // construction, so a listener who already heard clause 1 can never be
+    // handed a different clause 1 on the next tick.
+    const { rows: prev } = await client.query(
+      `SELECT segments FROM utterance_translations
+        WHERE utterance_id = $1 AND target_lang = $2 FOR UPDATE`,
+      [utteranceId, target]
+    );
+    const before = prev[0] && Array.isArray(prev[0].segments) ? prev[0].segments : [];
+    const sealed = segment.sealSegments(before, text, { final: false });
+    const segments = sealed.diverged ? before : sealed.segments;
     const seq = await bumpSeq(client, roomId);
     await client.query(
       `UPDATE utterance_translations
-          SET text = $3, status = 'partial', seq = $4
+          SET text = $3, status = 'partial', seq = $4,
+              segments = $5::jsonb, sealed_idx = $6,
+              first_segment_at = COALESCE(first_segment_at, CASE WHEN $6 > 0 THEN NOW() END)
         WHERE utterance_id = $1 AND target_lang = $2 AND status IN ('pending','partial')`,
-      [utteranceId, target, text, seq]
+      [utteranceId, target, text, seq, JSON.stringify(segments), segments.length]
     );
     await client.query('COMMIT');
   } catch (err) {
