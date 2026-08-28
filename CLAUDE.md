@@ -132,3 +132,30 @@ Two consequences worth remembering before changing anything here:
 - **Model IDs carry no date suffix** (`claude-opus-5`). `budget_tokens`
   and assistant prefill both 400 on Opus 5; `output_config: { effort: 'low' }`
   is the latency lever.
+- **Audio translation is sealed segments, not a media stream.** The server
+  cuts each streaming caption into clauses (`lib/segment.js`) and records how
+  many are *sealed* in `utterance_translations.segments` / `sealed_idx`. A
+  sealed clause is immutable, so the listener's browser can speak clause 1
+  while clause 2 is still being written; an unsealed tail is never spoken,
+  which is the `no-tts-for-partial-captions` invariant restated. `public/audio.js`
+  owns the whole speaking side (voice resolution, bounded queue, ducking sinks,
+  catch-up rate, fallback to text) and never sees anything but sealed text.
+- **`audio_mode` is the one listening preference; `tts_enabled` is derived.**
+  Three modes (`translation`, `original`, `both`), default `both`, on both
+  `user_language_prefs` and `room_participants`. `tts_enabled` is kept in step
+  as `(audio_mode <> 'original')` so older clients keep working; write the mode,
+  never the boolean.
+- **The audio leg is the fourth latency leg and is allowed to be absent.**
+  `latency_samples.audio_ms` / `audio_outcome` measure from "the clause was on
+  screen" to "the synthesiser actually started", so `total` stays the three-leg
+  number and `heard` is the four-leg one over rows that produced a voice. A
+  listener reading subtitles has no audio leg, and that is not a gap to fill.
+- **`realtime-audio` stays blocked.** Speech-to-speech needs a platform audio
+  capability that does not exist (the LLM proxy is text-only, storage is images
+  only). `lib/engine/realtime.js` reports `platform_capability_missing`; escalate
+  with `usernode-report-platform-issue` rather than reaching for a third-party
+  audio API.
+- **A held `/stream` request takes one plain tick after an empty hold**, and the
+  catch-up poll inside `flushOutbox` never holds. Both exist so a quiet room is
+  not sitting on an open socket forever, and so deep-linked UI (`?screen=languages`)
+  is never waiting eight seconds behind a long poll.
