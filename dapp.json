@@ -65,6 +65,16 @@
       "name": "Dial-in is announced but disabled",
       "path": "/room/DEMOSUP",
       "expectText": "Join by phone — coming soon"
+    },
+    {
+      "name": "Metrics reports the three latency legs",
+      "path": "/admin/metrics",
+      "expectText": "Ujung ke ujung"
+    },
+    {
+      "name": "A caption with no row for your language says so",
+      "path": "/room/DEMOTEAM",
+      "expectSelector": "#feed .utterance .translation.missing"
     }
   ]
 }

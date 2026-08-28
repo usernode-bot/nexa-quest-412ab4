@@ -83,6 +83,15 @@ Two consequences worth remembering before changing anything here:
   `seq`**, not a WebSocket — nothing in the platform conventions guarantees
   `Upgrade:` handling. A reconnect after a network drop is the same request
   with an older cursor, which is why reconnect needed no separate code path.
+- On the `direct` and `group` tiers that same request is **long-polled**:
+  `GET /stream?wait=1` parks in `lib/stream.js` until the room's `seq`
+  moves or the hold expires, then answers with `held: true` so the client
+  comes straight back instead of sleeping a second time. It is a bounded
+  `setTimeout` loop that re-runs one cheap `SELECT seq`, deliberately not
+  `LISTEN/NOTIFY` — a listening connection would be held out of the pool
+  per viewer, and a held HTTP request costs nothing but a socket. `large`
+  rooms never hold; they stay on the plain interval. The wait is abandoned
+  the moment `shuttingDown` flips, so a deploy still drains in ~3s.
 
 ## App-specific conventions
 
@@ -110,6 +119,16 @@ Two consequences worth remembering before changing anything here:
   own logic reads, so seeding the visitor would make the read-only
   non-member view untestable and different in production. The
   "Translation preview" test exists precisely to pin that.
+- **Latency is measured in three legs, and the client only ever reports
+  its own.** `utterances.capture_ms` is how long the microphone took,
+  `utterance_translations` carries the proxy leg, and the browser POSTs a
+  *duration* to `/api/rooms/:code/latency` — `ageMs` the server computed on
+  its own clock, plus the client's own elapsed render time. No client
+  timestamp is ever trusted, so nothing depends on the two clocks agreeing.
+  `lib/latency.js` joins the three legs server-side for `/admin/metrics`;
+  the raw samples live in the public `latency_samples` table and are pruned
+  by `houseKeeping`. Telemetry batches are fire and forget: a dropped batch
+  is the correct failure, never a retry loop.
 - **Model IDs carry no date suffix** (`claude-opus-5`). `budget_tokens`
   and assistant prefill both 400 on Opus 5; `output_config: { effort: 'low' }`
   is the latency lever.
