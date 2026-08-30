@@ -1,6 +1,14 @@
 {
   "name": "LIVE TRANSLATION",
-  "secrets": [],
+  "secrets": [
+    {
+      "key": "LT_ADMIN_USERNAMES",
+      "description": "Comma-separated platform usernames allowed to see the admin screens (cost, grants, pilot feedback, client errors). Leave empty and nobody is an admin.",
+      "required": false,
+      "private": false,
+      "default": ""
+    }
+  ],
   "llm": {
     "purpose": "Translates what people say in a call into each listener's language",
     "suggested_daily_cap_cents": 500
@@ -69,7 +77,7 @@
     {
       "name": "Metrics reports the three latency legs",
       "path": "/admin/metrics",
-      "expectText": "Ujung ke ujung"
+      "expectText": "End to end"
     },
     {
       "name": "A caption with no row for your language says so",
@@ -99,7 +107,62 @@
     {
       "name": "Metrics reports the audio leg",
       "path": "/admin/metrics",
-      "expectText": "Jalur suara"
+      "expectText": "Audio leg"
+    },
+    {
+      "name": "Metrics reports the three latency legs in Indonesian",
+      "path": "/admin/metrics?lang=id",
+      "expectText": "Ujung ke ujung"
+    },
+    {
+      "name": "Metrics shows the readiness panel",
+      "path": "/admin/metrics",
+      "expectSelector": "#readiness"
+    },
+    {
+      "name": "Metrics shows the failure breakdown",
+      "path": "/admin/metrics",
+      "expectSelector": "#failures"
+    },
+    {
+      "name": "Metrics honours the 24 hour range",
+      "path": "/admin/metrics?range=24h",
+      "expectSelector": "#readiness"
+    },
+    {
+      "name": "Alerts screen lists the rules",
+      "path": "/admin/alerts",
+      "expectSelector": "#alert-list"
+    },
+    {
+      "name": "Demo call plays a translated caption",
+      "path": "/demo",
+      "expectSelector": "#feed .utterance .translation"
+    },
+    {
+      "name": "Device check reports every probe",
+      "path": "/admin/compat",
+      "expectSelector": "#compat-table"
+    },
+    {
+      "name": "Pilot feedback form opens from a room",
+      "path": "/feedback?room=DEMOSUP&purpose=support",
+      "expectSelector": "#feedback-form"
+    },
+    {
+      "name": "Pilot feedback form is empty for a fresh visitor",
+      "path": "/feedback",
+      "expectText": "How well did it work?"
+    },
+    {
+      "name": "Pilot feedback list renders",
+      "path": "/admin/feedback",
+      "expectSelector": "#feedback-list"
+    },
+    {
+      "name": "Error console groups client and server errors",
+      "path": "/admin/errors",
+      "expectSelector": "#error-list"
     }
   ]
 }
