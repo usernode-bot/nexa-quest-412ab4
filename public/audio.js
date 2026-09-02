@@ -121,6 +121,14 @@
     var duck = createDuckBus(cfg);
 
     var mode = cfg.DEFAULT_MODE || 'both';
+    // How many sealed clauses to have in hand before the voice starts on a
+    // new sentence. Starting on clause one is the fastest possible first
+    // word and the most likely to stall mid-phrase waiting for clause two,
+    // so the cushion is adaptive: a room whose translations come back fast
+    // gets a lead of one, a slow room gets two. app.js sets it from the
+    // translate latencies it has actually observed in this room.
+    var lead = cfg.LEAD_SEGMENTS || 2;
+    var leadTimer = null;
     var queue = [];              // { key, utteranceId, targetLang, tag, index, text, offeredAt, ageMs }
     var spoken = new Map();      // key -> highest segment index already spoken
     var offered = new Map();     // key -> { first, sealedIdx, final, started }
@@ -141,9 +149,21 @@
 
     function changed() { if (typeof on.change === 'function') { try { on.change(); } catch (e) {} } }
 
+    // A device-level audio failure, reported through the app's own error
+    // channel. Deliberately never console.error: every proposal gets a free
+    // "loads with no console errors" check, so an app reporting a handled
+    // device limitation to the console would fail its own merge gate.
+    function reportAudio(code, detail) {
+      if (typeof window.ltReport !== 'function') return;
+      try { window.ltReport('audio', { code: code, message: String(detail || '') }); } catch (e) {}
+    }
+
     function markFallback(key, reason) {
       if (fallbacks.has(key)) return;
       fallbacks.add(key);
+      if (reason === 'never_started') {
+        reportAudio('audio_start_timeout', 'the synthesiser accepted a clause and never started it');
+      }
       lastOutcome = 'fallback';
       consecutiveFailures += 1;
       if (consecutiveFailures >= cfg.CONSECUTIVE_FALLBACKS_OFF) {
@@ -203,8 +223,29 @@
     }
 
     function pump() {
+      if (leadTimer) { clearTimeout(leadTimer); leadTimer = null; }
       if (speaking || !queue.length) return;
       if (!wantsTranslation() || !supported()) { queue.length = 0; return; }
+
+      // Lead-in, for the FIRST clause of a sentence only. Everything after it
+      // is already behind a voice that is speaking, so it never waits.
+      var head = queue[0];
+      if (spoken.get(head.key) === undefined) {
+        var rec = offered.get(head.key);
+        var have = 0;
+        for (var q = 0; q < queue.length; q += 1) if (queue[q].key === head.key) have += 1;
+        var waited = now() - head.offeredAt;
+        var waitMs = cfg.LEAD_WAIT_MS || 0;
+        var ready = (rec && rec.final) || have >= Math.max(1, lead) || waited >= waitMs;
+        if (!ready) {
+          // The cushion is a ceiling, not a requirement: whichever of "enough
+          // clauses" and "waited long enough" happens first wins, so a
+          // sentence that turns out to be one clause long is never held.
+          leadTimer = setTimeout(function () { leadTimer = null; pump(); },
+            Math.max(20, waitMs - waited));
+          return;
+        }
+      }
 
       var item = queue.shift();
 
@@ -277,7 +318,10 @@
       // onend is unreliable for long utterances; the watchdog is what keeps
       // the queue moving when it never fires.
       if (watchdog) clearTimeout(watchdog);
-      watchdog = setTimeout(function () { finish(item, 'watchdog'); }, cfg.SPEAK_WATCHDOG_MS);
+      watchdog = setTimeout(function () {
+        reportAudio('audio_watchdog', 'onend never fired for a clause that started');
+        finish(item, 'watchdog');
+      }, cfg.SPEAK_WATCHDOG_MS);
 
       try { window.speechSynthesis.speak(u); }
       catch (e) { markFallback(item.key, 'synthesis_failed'); finish(item, 'error'); }
@@ -298,6 +342,21 @@
       },
       wantsTranslation: wantsTranslation,
       supported: supported,
+
+      // Adaptive lead-in. Called by app.js with the translate p50 it has
+      // observed in this room, so a fast room starts speaking a clause
+      // earlier than a slow one instead of both using the same guess.
+      setLeadFromP50: function (p50) {
+        var fast = cfg.LEAD_SEGMENTS_FAST || 1;
+        var slow = cfg.LEAD_SEGMENTS || 2;
+        var next = (typeof p50 === 'number' && p50 > 0 && p50 < (cfg.LEAD_FAST_P50_MS || 800))
+          ? fast
+          : slow;
+        if (next === lead) return lead;
+        lead = next;
+        return lead;
+      },
+      lead: function () { return lead; },
       voiceCount: function () { return voices.count(); },
       voiceFor: function (tag) { var v = voices.pick(tag); return v ? v.name : null; },
 
@@ -373,6 +432,7 @@
       clear: function () {
         queue.length = 0;
         speaking = null;
+        if (leadTimer) { clearTimeout(leadTimer); leadTimer = null; }
         if (watchdog) { clearTimeout(watchdog); watchdog = null; }
         if (startTimer) { clearTimeout(startTimer); startTimer = null; }
         if (window.speechSynthesis) { try { window.speechSynthesis.cancel(); } catch (e) {} }
@@ -410,6 +470,7 @@
           consecutiveFailures: consecutiveFailures,
           unsealedBlocked: unsealedBlocked,
           rate: rate(),
+          lead: lead,
           lastOutcome: lastOutcome,
         };
       },

@@ -56,9 +56,71 @@
     setTimeout(() => el.remove(), 2600);
   }
 
+  // --- interface language --------------------------------------------------
+  // The table is served verbatim inside /api/config, so the client and the
+  // server cannot drift on a string. `t()` mirrors lib/strings.js exactly:
+  // missing key falls back to English, missing English returns the key, so a
+  // typo shows up on screen instead of blanking a label.
+  function t(key, vars) {
+    const tables = (S.config && S.config.strings) || {};
+    const table = tables[S.uiLang] || tables.en || {};
+    const en = tables.en || {};
+    const raw = table[key] != null ? table[key] : (en[key] != null ? en[key] : key);
+    if (!vars) return raw;
+    return String(raw).replace(/\{(\w+)\}/g, (m, k) => (
+      Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m
+    ));
+  }
+
+  // Map any BCP-47 tag onto a table we ship, or null for "no preference".
+  function resolveUiLang(tag) {
+    if (!tag) return null;
+    const tables = (S.config && S.config.strings) || {};
+    const v = String(tag).toLowerCase();
+    if (tables[v]) return v;
+    const prefix = v.split('-')[0];
+    return tables[prefix] ? prefix : null;
+  }
+
+  // --- client error reporting ----------------------------------------------
+  // Deliberately a fetch and never a console.error: every proposal gets a
+  // free "loads with no console errors" check, so a caught error written to
+  // the console would fail the merge gate for the app working as designed.
+  // The endpoint always answers {ok:true}, so this never needs a retry.
+  const reported = new Set();
+  function report(where, err) {
+    try {
+      const code = (err && (err.code || err.name)) || 'unknown';
+      const key = `${where}:${code}`;
+      // One report per cause per session. A poll that fails every second is
+      // one problem, not three hundred.
+      if (reported.has(key)) return;
+      reported.add(key);
+      const body = {
+        roomCode: (S.route && S.route.code) || null,
+        errors: [{
+          where: String(where).slice(0, 64),
+          code: String(code).slice(0, 48),
+          message: String((err && err.message) || '').slice(0, 300),
+        }],
+      };
+      fetch('/api/errors', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders },
+        body: JSON.stringify(body),
+        keepalive: true,
+      }).catch(() => {});
+    } catch { /* reporting must never be the thing that breaks */ }
+  }
+  window.ltReport = report;
+
   // --- state ---------------------------------------------------------------
   const S = {
     config: null,
+    // The interface language. Resolved in boot(); `?lang=` overrides it for
+    // one page view and writes nothing.
+    uiLang: 'en',
+    metricsRange: '7d',
     prefs: { speaksLang: 'en', hearsLang: 'en', audioMode: 'both', ttsEnabled: true, isDefault: true },
     route: null,
     room: null,
@@ -97,6 +159,9 @@
     backfilling: 0,
     // Delivery-latency samples measured in this tab, batched to the server.
     latency: { pending: [], recent: [], lastSentAt: 0, sampled: new Set(), byKey: new Map() },
+    // Translate-leg samples observed in this room, used to size the audio
+    // bus lead-in. Bounded, and reset when the route changes.
+    translateSamples: [],
     // Sealed clauses already handed to the audio bus, so a caption that is
     // still streaming is offered once per new clause and never re-offered.
     offeredSegments: new Map(),
@@ -108,6 +173,16 @@
     // asking it to. Server decides; this is only what it last answered.
     held: false,
     restTick: false,
+    // How long the last held /stream call actually parked for, in ms. The
+    // device-check screen reports it: an observed hold is the only honest
+    // proof that this browser and this network let a long poll through.
+    lastHoldMs: 0,
+    // Capability flags gathered by /admin/compat, reused by the pilot
+    // feedback form. Flags and counters only, never caption text.
+    compat: null,
+    // The scripted demo call. Client-side only: no API calls, no rows, no
+    // spend, and available in every environment because it is not data.
+    demo: { timers: [], seq: 0, running: false },
   };
 
   // The room's tier, with a shape that is safe to read before the first poll
@@ -146,6 +221,12 @@
     m = p.match(/^\/room\/([A-Za-z0-9]{3,12})$/);
     if (m) return { name: 'room', code: m[1].toUpperCase() };
     if (p === '/admin/metrics') return { name: 'metrics' };
+    if (p === '/admin/alerts') return { name: 'alerts' };
+    if (p === '/admin/compat') return { name: 'compat' };
+    if (p === '/admin/feedback') return { name: 'adminFeedback' };
+    if (p === '/admin/errors') return { name: 'errors' };
+    if (p === '/feedback') return { name: 'feedback' };
+    if (p === '/demo') return { name: 'demo' };
     return { name: 'lobby' };
   }
 
@@ -352,10 +433,15 @@
         </section>
 
         <section class="space-y-2">
+          <button id="try-demo" data-nav="/demo"
+                  class="un-pressable w-full p-3 rounded-xl bg-zinc-900 text-left ring-1 ring-zinc-800">
+            <span class="block text-sm font-medium">${esc(t('lobby.demo'))}</span>
+            <span class="block text-xs text-zinc-500 mt-0.5">${esc(t('lobby.demoBlurb'))}</span>
+          </button>
           <input id="room-title" maxlength="120" placeholder="Call title (optional)"
                  class="w-full px-3 py-3 rounded-xl bg-zinc-900 text-sm placeholder-zinc-600 outline-none focus:ring-1 focus:ring-violet-500">
           <button id="start-call" class="un-pressable w-full py-3.5 rounded-xl bg-violet-600 text-white font-semibold">
-            Start a call
+            ${esc(t('lobby.start'))}
           </button>
         </section>
 
@@ -927,11 +1013,11 @@
       // deliberately NEVER spoken — half a sentence read aloud, then the same
       // sentence again in full, is worse than a moment of silence.
       translationBlock = `<p class="translation partial text-sm text-zinc-400 italic">${esc(tr.text || '')}<span class="text-zinc-600">…</span></p>
-        <p class="text-[11px] text-zinc-700 mt-1">Still coming through — not read aloud until it is finished.</p>`;
+        <p class="text-[11px] text-zinc-700 mt-1">Still coming through. Not read aloud until it is finished.</p>`;
     } else if (tr && tr.status === 'pending') {
       translationBlock = `<p class="translation text-sm text-zinc-500 animate-pulse">Translating into ${esc(langOf(target).label)}…</p>`;
     } else if (tr && tr.status === 'unavailable') {
-      translationBlock = `<p class="translation text-sm text-amber-400/80">Translation unavailable here — showing the original.</p>`;
+      translationBlock = `<p class="translation text-sm text-amber-400/80">Translation unavailable here. Showing the original.</p>`;
     } else if (tr) {
       translationBlock = `<p class="translation text-sm text-red-400/80">Translation failed. The original is above.</p>`;
     } else if (captionIsMissing(u)) {
@@ -942,8 +1028,8 @@
         && new Date(u.createdAt).getTime() < S.langSwitchedAt;
       translationBlock = `<p class="translation missing text-sm text-zinc-500">${
         switched
-          ? `Diucapkan sebelum Anda pindah bahasa. Tidak ada teks ${esc(langOf(target).label)} untuk kalimat ini.`
-          : `Tidak ada teks ${esc(langOf(target).label)} untuk kalimat ini. Yang asli ada di atas.`
+          ? esc(t('audio.missingSwitched', { lang: langOf(target).label }))
+          : esc(t('audio.missing', { lang: langOf(target).label }))
       }</p>`;
     } else {
       translationBlock = `<p class="translation text-sm text-zinc-500">Waiting for a ${esc(langOf(target).label)} caption…</p>`;
@@ -985,7 +1071,7 @@
         <span class="text-zinc-500 shrink-0">Floor</span>
         <span class="font-mono shrink-0 ${holders.length ? 'text-emerald-400' : 'text-zinc-600'}">${holders.length}/${slots}</span>
         <span class="min-w-0 flex-1 truncate ${holders.length ? 'text-zinc-300' : 'text-zinc-600'}">${
-          holders.length ? `${esc(names)} speaking` : 'open — nobody is speaking'
+          holders.length ? `${esc(names)} speaking` : 'open, nobody is speaking'
         }</span>
         ${tier.handQueue && waiting
           ? `<span class="shrink-0 text-amber-400">✋ ${waiting} waiting</span>`
@@ -1031,7 +1117,7 @@
           <span class="text-sm font-mono text-zinc-400">${g.size}</span>
         </section>`).join('')}
       <p class="text-[11px] text-zinc-700">
-        A room this size is billed per language, not per person — these ${groups.length} groups cost
+        A room this size is billed per language, not per person. These ${groups.length} groups cost
         ${groups.length} translations per sentence, however many people are listening.
       </p>
     </div>`;
@@ -1104,10 +1190,10 @@
       const raised = !!me.handRaisedAt;
       return `
         <div class="p-3 rounded-xl bg-zinc-900 space-y-2">
-          <p class="text-sm text-zinc-400">This is a one-way call — the host and agents speak, you listen in ${esc(langOf(S.hearsLang).label)}.</p>
+          <p class="text-sm text-zinc-400">This is a one-way call. The host and agents speak, you listen in ${esc(langOf(S.hearsLang).label)}.</p>
           ${raised && S.myQueuePosition ? `<p id="queue-status" class="text-xs text-amber-300">✋ Number ${S.myQueuePosition} in the queue.</p>` : ''}
           <button id="raise-hand" class="un-pressable w-full py-2.5 rounded-lg ${raised ? 'bg-amber-500/20 text-amber-300' : 'bg-zinc-800 text-zinc-200'} text-sm font-medium">
-            ${raised ? '✋ Hand raised — waiting for the host' : '✋ Raise your hand'}
+            ${raised ? '✋ Hand raised, waiting for the host' : '✋ Raise your hand'}
           </button>
         </div>`;
     }
@@ -1147,7 +1233,7 @@
     // position. The server puts your hand up for you when it refuses, so this
     // line is a database fact rather than a guess.
     const queueLine = tier.handQueue && S.myQueuePosition
-      ? `<p id="queue-status" class="text-xs text-amber-300 px-1">✋ You are number ${S.myQueuePosition} in the queue — you will be able to speak when a slot opens.</p>`
+      ? `<p id="queue-status" class="text-xs text-amber-300 px-1">✋ You are number ${S.myQueuePosition} in the queue. You will be able to speak when a slot opens.</p>`
       : '';
     return `
       <div class="space-y-2">
@@ -1204,9 +1290,9 @@
     const b = S.budget;
     if (!b || !b.level || b.level === 'normal') return '';
     const copy = {
-      shed_small: 'Nearing the daily AI budget — only the largest language group is being translated for now.',
-      floor_only: 'Close to the daily AI budget — only what the floor-holders say is being translated.',
-      transcript_only: 'The daily AI budget is spent — the call is running transcript-only until it resets.',
+      shed_small: 'Nearing the daily AI budget. Only the largest language group is being translated for now.',
+      floor_only: 'Close to the daily AI budget. Only what the floor-holders say is being translated.',
+      transcript_only: 'The daily AI budget is spent. The call is running transcript-only until it resets.',
     };
     return `<div id="budget-notice" data-level="${esc(b.level)}" class="p-2.5 rounded-lg bg-amber-500/10 text-amber-300 text-xs">
       ${esc(copy[b.level] || 'Translation is degraded to stay inside the daily AI budget.')}
@@ -1238,7 +1324,7 @@
         ${!S.connected ? `<div id="reconnect-notice" class="p-2.5 rounded-lg bg-amber-500/10 text-amber-300 text-xs">${reconnectCopy()}</div>` : ''}
         ${room.endedAt ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">This call has ended.</div>` : ''}
         ${room.mode === 'transcript_only' ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-300 text-xs">Transcript-only mode: everything is captured in the original language, nothing is translated.</div>` : ''}
-        ${S.config && !S.config.llmEnabled ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">Live translation is unavailable in this environment — captions show the original language.</div>` : ''}
+        ${S.config && !S.config.llmEnabled ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">Live translation is unavailable in this environment. Captions show the original language.</div>` : ''}
         ${budgetNoticeHTML()}
 
         ${floorHTML()}
@@ -1272,6 +1358,11 @@
 
         <div class="pt-2 text-center">
           <p class="text-[11px] text-zinc-700">Share this call: code <span class="font-mono text-zinc-500">${esc(room.code)}</span></p>
+          <p class="text-[11px] text-zinc-700">
+            <a href="/feedback?room=${esc(room.code)}&purpose=${esc(room.purpose || '')}"
+               data-nav="/feedback?room=${esc(room.code)}&purpose=${esc(room.purpose || '')}"
+               class="underline decoration-zinc-800">${esc(t('feedback.title'))}</a>
+          </p>
         </div>
       </main>`;
 
@@ -1505,7 +1596,7 @@
           : (holder ? holder.username : 'Someone else');
         setMicError(
           d.position
-            ? `${who} ${names.length > 1 ? 'have' : 'has'} the floor — your hand is up, you are number ${d.position}.`
+            ? `${who} ${names.length > 1 ? 'have' : 'has'} the floor. Your hand is up, you are number ${d.position}.`
             : `${who} ${names.length > 1 ? 'have' : 'has'} the floor right now.`
         );
         if (S.room) renderRoom();
@@ -1528,10 +1619,24 @@
     await sendUtterance(text, 'voice', captureMs);
   }
 
+  // One id per sentence, minted where the sentence starts. It travels with
+  // the utterance through the fan-out, the translation write and the latency
+  // sample, so a slow caption can be followed across the three legs in the
+  // logs instead of being guessed at from timestamps.
+  function newTraceId() {
+    try {
+      if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        return window.crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+      }
+    } catch { /* fall through */ }
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`.slice(0, 16);
+  }
+
   async function sendUtterance(text, via, captureMs) {
     const localId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const item = {
       id: localId, code: S.route.code, text, via, sourceLang: S.prefs.speaksLang,
+      traceId: newTraceId(),
       // Queued in the outbox with the sentence, so a phrase that waited out a
       // dropped connection still reports the capture time it actually had
       // rather than the time it spent offline.
@@ -1549,7 +1654,7 @@
           method: 'POST',
           body: {
             text: item.text, via: item.via, sourceLang: item.sourceLang,
-            captureMs: item.captureMs,
+            captureMs: item.captureMs, traceId: item.traceId,
           },
         });
         outbox.remove(item.id);
@@ -1560,6 +1665,7 @@
           outbox.remove(item.id);
           notify(err.message);
         } else {
+          report('outbox', err);
           S.connected = false;
           return;
         }
@@ -1614,12 +1720,16 @@
         // broken leaves you guessing about the moment they stop being broken.
         const queued = outbox.read().filter((i) => i.code === S.route.code).length;
         notify(queued
-          ? `Tersambung lagi. ${queued} kalimat terkirim.`
-          : 'Tersambung lagi.');
+          ? t('room.reconnectedSent', { n: queued })
+          : t('room.reconnected'));
       }
       S.connected = true;
       S.held = !!data.held;
       S.restTick = !!data.held;
+      // What the hold actually cost, measured on one clock. /admin/compat
+      // reads it: a browser or proxy that quietly caps request duration shows
+      // up here as a hold far shorter than the server asked for.
+      if (wait) S.lastHoldMs = Math.max(0, receivedAt - requestedAt);
       S.error = null;
 
       if (data.me) {
@@ -1649,6 +1759,7 @@
       S.cursor = data.seq;
       if (data.seq !== before) S.lastChangeAt = Date.now();
 
+      noteTranslateLatency(data.events);
       noteDelivery(data.events, requestedAt, receivedAt);
       // Sealed clauses of captions still being written. This is the whole
       // latency win: clause 1 is spoken while clause 2 is still arriving.
@@ -1693,11 +1804,34 @@
         stopPolling();
         return;
       }
+      // A 404 is the room, not the app. Anything else is worth knowing
+      // about centrally, once per cause per session.
+      report('poll', err);
       S.connected = false;
       S.held = false;
       S.restTick = false;
       if (S.room) renderRoom();
     }
+  }
+
+  // The audio bus starts a sentence once it holds `lead` sealed clauses, and
+  // how big that cushion should be depends on how fast this room's captions
+  // actually come back. Rooms differ (a townhall fanning out to four
+  // languages is not a two-person call), so the number is observed here
+  // rather than fixed in config.
+  function noteTranslateLatency(events) {
+    if (!Array.isArray(events) || !events.length || !Audio) return;
+    let saw = false;
+    for (const ev of events) {
+      if (!ev || ev.type !== 'translation.final') continue;
+      if (typeof ev.latencyMs !== 'number' || ev.latencyMs <= 0) continue;
+      S.translateSamples.push(ev.latencyMs);
+      if (S.translateSamples.length > 20) S.translateSamples.shift();
+      saw = true;
+    }
+    if (!saw || S.translateSamples.length < 3) return;
+    const sorted = S.translateSamples.slice().sort((a, b) => a - b);
+    Audio.setLeadFromP50(sorted[Math.floor(sorted.length / 2)]);
   }
 
   // --- delivery latency ----------------------------------------------------
@@ -1785,12 +1919,15 @@
       ${header('LIVE TRANSLATION', { back: '/' })}
       <main class="max-w-2xl mx-auto px-4 py-16 text-center space-y-3">
         <p class="text-4xl">🔍</p>
-        <h2 class="text-lg font-semibold">Room not found</h2>
+        <h2 class="text-lg font-semibold">${esc(t('room.notFound'))}</h2>
         <p class="text-sm text-zinc-500">
-          No call is using the code <span class="font-mono text-zinc-400">${esc(S.route.code)}</span>.
-          Check the code, or start a new call.
+          <span class="font-mono text-zinc-400">${esc(S.route.code)}</span><br>
+          ${esc(t('room.notFoundBlurb'))}
         </p>
-        <button data-nav="/" class="un-pressable mt-2 px-5 py-2.5 rounded-xl bg-violet-600 text-white text-sm font-medium">Back to the lobby</button>
+        <button data-nav="/" class="un-pressable mt-2 px-5 py-2.5 rounded-xl bg-violet-600 text-white text-sm font-medium">${esc(t('common.back'))}</button>
+        <p class="pt-2">
+          <a href="/demo" data-nav="/demo" class="text-sm text-violet-400 underline decoration-violet-900">${esc(t('lobby.demo'))}</a>
+        </p>
       </main>`;
     bindNav(appEl());
   }
@@ -1832,29 +1969,67 @@
         </div>
         ${s.avg_latency_ms != null
           ? `<p class="text-xs text-zinc-600 text-center">Average caption latency ${s.avg_latency_ms} ms</p>` : ''}
-        <button data-nav="/" class="un-pressable w-full py-3 rounded-xl bg-violet-600 text-white font-medium">Back to the lobby</button>
+        <button data-nav="/feedback?room=${esc(S.route.code)}&purpose=${esc(data.room.purpose || '')}"
+                class="un-pressable w-full p-3 rounded-xl bg-zinc-900 text-left ring-1 ring-zinc-800">
+          <span class="block text-sm font-medium">${esc(t('feedback.title'))}</span>
+          <span class="block text-xs text-zinc-500 mt-0.5">${esc(t('feedback.blurb'))}</span>
+        </button>
+        <button data-nav="/" class="un-pressable w-full py-3 rounded-xl bg-violet-600 text-white font-medium">${esc(t('common.back'))}</button>
       </main>`;
     bindNav(appEl());
   }
 
   // --- metrics -------------------------------------------------------------
+  // Verdict colours are shared by the readiness panel and the alert list, so
+  // "warn" means the same shade of amber in both places.
+  function verdictClass(v) {
+    if (v === 'pass') return 'bg-emerald-500/15 text-emerald-300';
+    if (v === 'warn') return 'bg-amber-500/15 text-amber-300';
+    if (v === 'crit') return 'bg-red-500/15 text-red-300';
+    return 'bg-zinc-800 text-zinc-400';
+  }
+
+  function fmtCheckValue(c) {
+    if (c.value == null) return '—';
+    if (c.unit === 'rate') return `${(Number(c.value) * 100).toFixed(1)}%`;
+    return `${Math.round(Number(c.value))} ms`;
+  }
+  function fmtCheckTarget(c) {
+    if (c.target == null) return '';
+    return c.unit === 'rate'
+      ? `${t('metrics.target')} ${(Number(c.target) * 100).toFixed(0)}%`
+      : `${t('metrics.target')} ${c.target} ms`;
+  }
+
+  function alertBannerHTML(count) {
+    if (!count) return '';
+    return `<button data-nav="/admin/alerts"
+      class="un-pressable w-full text-left p-3 rounded-xl bg-red-500/10 text-red-300 text-sm">
+      ${esc(t('alerts.banner', { n: count }))}
+    </button>`;
+  }
+
   async function renderMetrics() {
-    appEl().innerHTML = `${header('Service metrics', { back: '/' })}
-      <main class="max-w-2xl mx-auto px-4 py-10 text-center text-sm text-zinc-500">Loading…</main>`;
+    const range = new URLSearchParams(location.search).get('range');
+    S.metricsRange = range === '1h' || range === '24h' ? range : '7d';
+    appEl().innerHTML = `${header(t('metrics.title'), { back: '/' })}
+      <main class="max-w-2xl mx-auto px-4 py-10 text-center text-sm text-zinc-500">${esc(t('common.loading'))}</main>`;
     let m;
     try {
-      m = await api('/api/metrics');
+      m = await api(`/api/metrics?range=${encodeURIComponent(S.metricsRange)}`);
     } catch (err) {
-      appEl().innerHTML = `${header('Service metrics', { back: '/' })}
+      report('metrics', err);
+      appEl().innerHTML = `${header(t('metrics.title'), { back: '/' })}
         <main class="max-w-2xl mx-auto px-4 py-10 text-center text-sm text-zinc-500">${esc(err.message)}</main>`;
       bindNav(appEl());
       return;
     }
     const l = m.latency || {};
     const c = m.cost || {};
+    const admin = m.cost != null;
     const tierLabel = (key) => {
-      const t = ((S.config && S.config.tiers) || []).find((x) => x.key === key);
-      return t ? t.label : (key || 'unknown');
+      const tt = ((S.config && S.config.tiers) || []).find((x) => x.key === key);
+      return tt ? tt.label : (key || 'unknown');
     };
     const row = (label, value, hint) => `
       <div class="flex items-baseline justify-between gap-3 px-3 py-2.5 rounded-lg bg-zinc-900">
@@ -1862,15 +2037,60 @@
         <span class="text-sm font-mono">${esc(value)}</span>
         ${hint ? `<span class="text-[11px] text-zinc-600">${esc(hint)}</span>` : ''}
       </div>`;
+    // Admin-only numbers keep their LABEL in every case. A row that vanishes
+    // for most viewers makes the dashboard look broken rather than gated, and
+    // the label plus "visible to app admins" says exactly what is going on.
+    const adminRow = (label, value, hint) => row(label, admin ? value : '—', admin ? hint : t('metrics.adminOnly'));
     const e2e = (m.endToEnd && m.endToEnd.overall) || {};
     const e2eTiers = (m.endToEnd && m.endToEnd.byTier) || [];
     const ms = (v) => (v == null ? '—' : `${Math.round(v)} ms`);
     const maxU = Math.max(1, ...(m.daily || []).map((d) => d.utterances));
+    const rangeLabel = { '1h': '1h', '24h': t('common.hours24'), '7d': t('common.days7') };
+    const rangeBtn = (key) => `
+      <button data-nav="/admin/metrics?range=${key}"
+        class="un-pressable px-3 py-1.5 rounded-full text-xs ${S.metricsRange === key ? 'bg-violet-600 text-white' : 'bg-zinc-900 text-zinc-400'}">
+        ${esc(rangeLabel[key])}
+      </button>`;
+    const checks = (m.slo && m.slo.checks) || [];
+    const failures = (m.failures && m.failures.rows) || [];
+
     appEl().innerHTML = `
-      ${header('Service metrics', { back: '/' })}
+      ${header(t('metrics.title'), { back: '/' })}
       <main class="max-w-2xl mx-auto px-4 py-5 space-y-5">
+        ${alertBannerHTML(m.openAlerts || 0)}
+
+        <div class="flex items-center gap-2">
+          <span class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('metrics.range'))}</span>
+          ${rangeBtn('1h')}${rangeBtn('24h')}${rangeBtn('7d')}
+        </div>
+
+        <section id="readiness" class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('metrics.readiness'))}</h2>
+          <p class="text-[11px] text-zinc-600 px-1">${esc(t('metrics.readinessBlurb'))}</p>
+          ${checks.map((ck) => `
+            <div class="px-3 py-2.5 rounded-lg bg-zinc-900 space-y-1">
+              <div class="flex items-baseline justify-between gap-3">
+                <span class="text-sm text-zinc-300">${esc(ck.label)}</span>
+                <span class="text-sm font-mono">${esc(fmtCheckValue(ck))}</span>
+                <span class="px-2 py-0.5 rounded-full text-[11px] ${verdictClass(ck.verdict)}">${esc(t(`verdict.${ck.verdict}`))}</span>
+              </div>
+              <p class="text-[11px] text-zinc-600">${esc(fmtCheckTarget(ck))} · ${ck.n || 0} ${esc(t('metrics.samples'))}${ck.note ? ` · ${esc(ck.note)}` : ''}</p>
+            </div>`).join('')}
+        </section>
+
+        <section id="failures" class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('metrics.failures'))}</h2>
+          ${failures.length
+            ? failures.map((f) => row(
+              f.code || 'unknown',
+              `${f.n}`,
+              `${f.status} · ${Math.round((f.share || 0) * 1000) / 10}%`
+            )).join('')
+            : `<p class="text-sm text-zinc-600">${esc(t('metrics.noFailures'))}</p>`}
+        </section>
+
         <section class="space-y-1.5">
-          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Caption latency (7 days)</h2>
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Caption latency</h2>
           ${row('p50 latency', l.p50 != null ? `${l.p50} ms` : '—')}
           ${row('p95 latency', l.p95 != null ? `${l.p95} ms` : '—')}
           ${row('p50 first word', l.ttft_p50 != null ? `${l.ttft_p50} ms` : '—', 'streamed')}
@@ -1881,67 +2101,53 @@
         </section>
 
         <section id="end-to-end" class="space-y-1.5">
-          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Ujung ke ujung (7 hari)</h2>
-          <p class="text-[11px] text-zinc-600 px-1">
-            Tiga bagian dari satu kalimat: waktu bicara sampai selesai, waktu terjemahan,
-            dan waktu sampai teks tampil di layar pendengar.
-          </p>
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('metrics.endToEnd'))}</h2>
           ${e2e.n
             ? `
-              ${row('Total p50', ms(e2e.total_p50), `${e2e.n} sampel`)}
-              ${row('Total p95', ms(e2e.total_p95))}
-              ${row('Bicara p50 / p95', `${ms(e2e.capture_p50)} / ${ms(e2e.capture_p95)}`, 'mikrofon')}
-              ${row('Terjemah p50 / p95', `${ms(e2e.translate_p50)} / ${ms(e2e.translate_p95)}`, 'proxy')}
-              ${row('Kirim p50 / p95', `${ms(e2e.deliver_p50)} / ${ms(e2e.deliver_p95)}`, 'ke layar')}
-              ${(e2eTiers.length
-                ? e2eTiers.map((t) => row(
-                  tierLabel(t.tier),
-                  `${ms(t.total_p50)} / ${ms(t.total_p95)}`,
-                  `${t.n} sampel`
-                )).join('')
-                : '')}`
-            : '<p class="text-sm text-zinc-600">Belum ada sampel ujung ke ujung pada rentang ini.</p>'}
+              ${row(t('metrics.totalLeg'), `${ms(e2e.total_p50)} / ${ms(e2e.total_p95)}`, `${e2e.n} ${t('metrics.samples')}`)}
+              ${row(t('metrics.captureLeg'), `${ms(e2e.capture_p50)} / ${ms(e2e.capture_p95)}`)}
+              ${row(t('metrics.translateLeg'), `${ms(e2e.translate_p50)} / ${ms(e2e.translate_p95)}`)}
+              ${row(t('metrics.deliverLeg'), `${ms(e2e.deliver_p50)} / ${ms(e2e.deliver_p95)}`, t('metrics.deliverNote'))}
+              ${e2eTiers.map((tt) => row(
+                tierLabel(tt.tier),
+                `${ms(tt.total_p50)} / ${ms(tt.total_p95)}`,
+                `${tt.n} ${t('metrics.samples')}`
+              )).join('')}`
+            : `<p class="text-sm text-zinc-600">${esc(t('metrics.noSamples'))}</p>`}
         </section>
 
         <section id="audio-leg" class="space-y-1.5">
-          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Jalur suara (7 hari)</h2>
-          <p class="text-[11px] text-zinc-600 px-1">
-            Bagian keempat: dari klausa tampil di layar sampai suara terjemahan benar benar mulai
-            dibacakan di perangkat pendengar. Hanya kalimat yang memang berbunyi yang dihitung,
-            jadi pendengar yang sengaja membaca saja tidak ikut menurunkan angkanya.
-          </p>
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('metrics.audioLeg'))}</h2>
           ${e2e.audio_n
             ? `
-              ${row('Suara p50', ms(e2e.audio_p50), `${e2e.audio_n} sampel`)}
-              ${row('Suara p95', ms(e2e.audio_p95))}
-              ${row('Sampai terdengar p50', ms(e2e.heard_p50), 'empat jalur')}
-              ${row('Sampai terdengar p95', ms(e2e.heard_p95), 'empat jalur')}
-              ${row('Gagal dibacakan', e2e.audio_fallbacks || 0, 'jatuh ke teks')}`
-            : '<p class="text-sm text-zinc-600">Belum ada kalimat yang dibacakan pada rentang ini.</p>'}
+              ${row(t('metrics.audioStart'), `${ms(e2e.audio_p50)} / ${ms(e2e.audio_p95)}`, `${e2e.audio_n} ${t('metrics.samples')}`)}
+              ${row(t('metrics.heardLeg'), `${ms(e2e.heard_p50)} / ${ms(e2e.heard_p95)}`)}
+              ${row(t('metrics.audioFallbacks'), e2e.audio_fallbacks || 0, t('metrics.audioFallbackNote'))}`
+            : `<p class="text-sm text-zinc-600">${esc(t('metrics.noAudio'))}</p>`}
         </section>
 
         <section class="space-y-1.5">
-          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Latency by room size (7 days)</h2>
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Latency by room size</h2>
           ${(m.byTier || []).length
-            ? (m.byTier || []).map((t) => row(
-              tierLabel(t.tier),
-              `${t.p50 != null ? `${t.p50} ms` : '—'} / ${t.p95 != null ? `${t.p95} ms` : '—'}`,
-              `${t.n} captions`
+            ? (m.byTier || []).map((tt) => row(
+              tierLabel(tt.tier),
+              `${tt.p50 != null ? `${tt.p50} ms` : '—'} / ${tt.p95 != null ? `${tt.p95} ms` : '—'}`,
+              `${tt.n} captions`
             )).join('')
             : '<p class="text-sm text-zinc-600">No captions in this window.</p>'}
         </section>
 
         <section class="space-y-1.5">
-          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Cost (7 days)</h2>
-          ${row('Cost per call', c.centsPerCall != null ? `${c.centsPerCall.toFixed(4)}¢` : '—', 'proxy meter')}
-          ${row('translation calls', c.calls || 0)}
-          ${row('sentences said', c.utterances || 0)}
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Cost</h2>
+          ${adminRow('Cost per call', c.centsPerCall != null ? `${c.centsPerCall.toFixed(4)}¢` : '—', 'proxy meter')}
+          ${adminRow('translation calls', c.calls || 0)}
+          ${adminRow('sentences said', c.utterances || 0)}
           ${row('listeners per call', l.avg_group_size != null ? `${l.avg_group_size}×` : '—', 'grouping payoff')}
-          ${row('sittings recorded', c.sessions || 0)}
+          ${adminRow('sittings recorded', c.sessions || 0)}
         </section>
 
         <section class="space-y-1.5">
-          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Budget degradation (7 days)</h2>
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Budget degradation</h2>
           ${row('largest group only', (m.degraded && m.degraded.shed_small) || 0, '≥70% of cap')}
           ${row('floor-holders only', (m.degraded && m.degraded.floor_only) || 0, '≥90% of cap')}
           ${row('transcript only', (m.degraded && m.degraded.transcript_only) || 0, 'cap spent')}
@@ -1967,9 +2173,9 @@
 
         <section class="space-y-1.5">
           <h2 class="text-xs uppercase tracking-wide text-zinc-500">Translation grant acceptance (30 days)</h2>
-          ${row('asked', (m.grants && m.grants.asked) || 0)}
-          ${row('granted', (m.grants && m.grants.granted) || 0)}
-          ${row('acceptance rate', m.grants && m.grants.acceptanceRate != null ? `${m.grants.acceptanceRate}%` : '—')}
+          ${adminRow('asked', (m.grants && m.grants.asked) || 0)}
+          ${adminRow('granted', (m.grants && m.grants.granted) || 0)}
+          ${adminRow('acceptance rate', m.grants && m.grants.acceptanceRate != null ? `${m.grants.acceptanceRate}%` : '—')}
         </section>
 
         <section>
@@ -1985,8 +2191,512 @@
               </div>`).join('') || '<p class="text-sm text-zinc-600">No usage recorded yet.</p>'}
           </div>
         </section>
+
+        <p class="text-center text-xs text-zinc-700 space-x-3">
+          <a href="/admin/alerts" data-nav="/admin/alerts" class="underline decoration-zinc-800">${esc(t('alerts.title'))}</a>
+          <a href="/admin/compat" data-nav="/admin/compat" class="underline decoration-zinc-800">${esc(t('compat.title'))}</a>
+          <a href="/admin/errors" data-nav="/admin/errors" class="underline decoration-zinc-800">${esc(t('errors.title'))}</a>
+          <a href="/admin/feedback" data-nav="/admin/feedback" class="underline decoration-zinc-800">${esc(t('feedback.listTitle'))}</a>
+        </p>
       </main>`;
     bindNav(appEl());
+  }
+
+  // --- alerts --------------------------------------------------------------
+  async function renderAlerts() {
+    appEl().innerHTML = `${header(t('alerts.title'), { back: '/admin/metrics' })}
+      <main class="max-w-2xl mx-auto px-4 py-10 text-center text-sm text-zinc-500">${esc(t('common.loading'))}</main>`;
+    let data;
+    try {
+      data = await api('/api/alerts?limit=40');
+    } catch (err) {
+      report('alerts', err);
+      appEl().innerHTML = `${header(t('alerts.title'), { back: '/admin/metrics' })}
+        <main class="max-w-2xl mx-auto px-4 py-10 text-center text-sm text-zinc-500">${esc(err.message)}</main>`;
+      bindNav(appEl());
+      return;
+    }
+    const list = data.alerts || [];
+    const open = list.filter((a) => !a.resolved_at);
+    const closed = list.filter((a) => a.resolved_at);
+    const when = (iso) => {
+      try { return new Date(iso).toLocaleString(); } catch { return String(iso || ''); }
+    };
+    const card = (a) => `
+      <div class="p-3 rounded-xl bg-zinc-900 space-y-1">
+        <div class="flex items-baseline justify-between gap-3">
+          <span class="text-sm">${esc(t(`alerts.rule.${a.rule}`))}</span>
+          <span class="px-2 py-0.5 rounded-full text-[11px] ${verdictClass(a.resolved_at ? 'pass' : (a.severity === 'crit' ? 'crit' : 'warn'))}">
+            ${esc(a.resolved_at ? t('alerts.resolved') : t('alerts.open'))}
+          </span>
+        </div>
+        <p class="text-xs text-zinc-500 font-mono">${esc(a.rule)}${a.room_code ? ` · ${esc(a.room_code)}` : ''}</p>
+        ${a.detail ? `<p class="text-xs text-zinc-400">${esc(a.detail)}</p>` : ''}
+        <p class="text-[11px] text-zinc-600">${esc(t('alerts.opened'))} ${esc(when(a.opened_at))}</p>
+      </div>`;
+    appEl().innerHTML = `
+      ${header(t('alerts.title'), { back: '/admin/metrics' })}
+      <main class="max-w-2xl mx-auto px-4 py-5 space-y-5">
+        <p class="text-[11px] text-zinc-600">
+          ${esc(t('metrics.readinessBlurb'))} ${Math.round((data.evalIntervalMs || 300000) / 60000)} min.
+        </p>
+        <section id="alert-list" class="space-y-2">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('alerts.open'))}</h2>
+          ${open.length ? open.map(card).join('') : `<p class="text-sm text-zinc-600">${esc(t('alerts.noneOpen'))}</p>`}
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500 pt-3">${esc(t('alerts.resolved'))}</h2>
+          ${closed.length ? closed.map(card).join('') : `<p class="text-sm text-zinc-600">${esc(t('alerts.none'))}</p>`}
+        </section>
+        <section class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">Rules</h2>
+          ${(data.rules || []).map((r) => `
+            <div class="flex items-baseline justify-between gap-3 px-3 py-2 rounded-lg bg-zinc-900">
+              <span class="text-sm text-zinc-400">${esc(t(`alerts.rule.${r}`))}</span>
+              <span class="text-[11px] font-mono text-zinc-600">${esc(r)}</span>
+            </div>`).join('')}
+        </section>
+      </main>`;
+    bindNav(appEl());
+  }
+
+  // --- device check --------------------------------------------------------
+  // Every row here is something a real browser answers for itself, which is
+  // why there is no automated cross-browser suite in this repo: the matrix in
+  // docs/testing-checklist.md is filled in by opening this screen on each
+  // device and writing down what it says.
+  async function probeCompat() {
+    const out = {};
+    out.speech = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+    out.tts = !!(window.speechSynthesis && window.SpeechSynthesisUtterance);
+    out.audioContext = !!(window.AudioContext || window.webkitAudioContext);
+    try {
+      localStorage.setItem('lt.probe', '1');
+      localStorage.removeItem('lt.probe');
+      out.storage = true;
+    } catch { out.storage = false; }
+
+    // The microphone is the important one. The platform delegates only
+    // geolocation, clipboard-write and pointer-lock to app frames, and an
+    // undelegated capability rejects with the SAME PERMISSION_DENIED a person
+    // tapping Block produces. So ask the frame's own policy first: "the page
+    // that embeds us never handed this down" is a different answer from "you
+    // said no", and telling someone to check a permission they were never
+    // asked for is the failure this screen exists to prevent.
+    let delegated = null;
+    try {
+      const policy = document.permissionsPolicy || document.featurePolicy;
+      if (policy && typeof policy.allowsFeature === 'function') {
+        delegated = policy.allowsFeature('microphone');
+      }
+    } catch { delegated = null; }
+    let micState = null;
+    try {
+      if (navigator.permissions && navigator.permissions.query) {
+        const st = await navigator.permissions.query({ name: 'microphone' });
+        micState = st && st.state;
+      }
+    } catch { micState = null; }
+    out.micPolicy = delegated === false ? 'blocked' : (delegated === true ? 'delegated' : 'unknown');
+    out.mic = delegated === false ? false : (micState === 'granted' ? true : (micState === 'denied' ? false : null));
+
+    // Voices are counted per launch language, because "speech synthesis
+    // works" and "this device can say Bahasa Indonesia" are different facts.
+    const voices = {};
+    let voiceCount = 0;
+    for (const lang of (S.config && S.config.languages) || []) {
+      const name = Audio && typeof Audio.voiceFor === 'function' ? Audio.voiceFor(lang.tts) : null;
+      voices[lang.code] = name;
+      if (name) voiceCount += 1;
+    }
+    out.voices = voiceCount;
+
+    let safeArea = 'unknown';
+    try {
+      const v = getComputedStyle(document.documentElement)
+        .getPropertyValue('--un-safe-inset-bottom').trim();
+      safeArea = v ? v : 'unset';
+    } catch { safeArea = 'unknown'; }
+    out.safeArea = safeArea;
+    out.longPoll = S.lastHoldMs > 0 ? Math.round(S.lastHoldMs) : 0;
+    out.platform = (window.unNative && window.unNative.platform) || 'unknown';
+    out.tier = (S.tier && S.tier.key) || 'none';
+    return { flags: out, voices, delegated, micState };
+  }
+
+  async function renderCompat() {
+    appEl().innerHTML = `${header(t('compat.title'), { back: '/' })}
+      <main class="max-w-2xl mx-auto px-4 py-10 text-center text-sm text-zinc-500">${esc(t('common.loading'))}</main>`;
+    const probe = await probeCompat();
+    S.compat = probe.flags;
+    const f = probe.flags;
+    const badge = (state) => {
+      const cls = state === 'yes' ? 'pass' : state === 'no' ? 'crit' : state === 'blocked' ? 'warn' : 'insufficient';
+      const label = state === 'yes' ? t('compat.yes')
+        : state === 'no' ? t('compat.no')
+          : state === 'blocked' ? t('compat.micBlocked') : t('compat.unknown');
+      return `<span class="px-2 py-0.5 rounded-full text-[11px] shrink-0 ${verdictClass(cls)}">${esc(label)}</span>`;
+    };
+    const rowFor = (label, state, note) => `
+      <div class="px-3 py-2.5 rounded-lg bg-zinc-900 space-y-1">
+        <div class="flex items-baseline justify-between gap-3">
+          <span class="text-sm text-zinc-300">${esc(label)}</span>
+          ${badge(state)}
+        </div>
+        ${note ? `<p class="text-[11px] text-zinc-600">${esc(note)}</p>` : ''}
+      </div>`;
+    const micState = f.micPolicy === 'blocked' ? 'blocked' : (f.mic === true ? 'yes' : (f.mic === false ? 'no' : 'unknown'));
+    const missingVoices = Object.keys(probe.voices || {})
+      .filter((k) => !probe.voices[k])
+      .map((k) => langOf(k).label);
+    const langCount = ((S.config && S.config.languages) || []).length;
+
+    appEl().innerHTML = `
+      ${header(t('compat.title'), { back: '/' })}
+      <main class="max-w-2xl mx-auto px-4 py-5 space-y-4">
+        <p class="text-sm text-zinc-400">${esc(t('compat.blurb'))}</p>
+        ${micState !== 'yes' ? `<p class="p-3 rounded-xl bg-amber-500/10 text-amber-300 text-xs">${esc(t('compat.typedFallback'))}</p>` : ''}
+        <section id="compat-table" class="space-y-1.5">
+          ${rowFor(t('compat.speech'), f.speech ? 'yes' : 'no',
+            f.speech ? '' : 'This browser has no speech recognition. Type instead.')}
+          ${rowFor(t('compat.mic'), micState, t('compat.micNote'))}
+          ${rowFor(t('compat.tts'), f.tts ? 'yes' : 'no')}
+          ${rowFor(t('compat.voices'), f.voices >= langCount ? 'yes' : (f.voices ? 'blocked' : 'no'),
+            missingVoices.length ? `${t('common.none')}: ${missingVoices.join(', ')}` : '')}
+          ${rowFor(t('compat.audioContext'), f.audioContext ? 'yes' : 'no')}
+          ${rowFor(t('compat.storage'), f.storage ? 'yes' : 'no')}
+          ${rowFor(t('compat.longPoll'), f.longPoll > 0 ? 'yes' : 'unknown',
+            f.longPoll > 0 ? `${f.longPoll} ms held` : 'Open a call first, then come back.')}
+          ${rowFor(t('compat.safeArea'), f.safeArea && f.safeArea !== 'unset' && f.safeArea !== 'unknown' ? 'yes' : 'unknown',
+            String(f.safeArea))}
+        </section>
+        <p class="text-center text-xs text-zinc-700">
+          <a href="/feedback" data-nav="/feedback" class="underline decoration-zinc-800">${esc(t('feedback.title'))}</a>
+        </p>
+      </main>`;
+    bindNav(appEl());
+  }
+
+  // --- pilot feedback ------------------------------------------------------
+  async function renderFeedback() {
+    const q = new URLSearchParams(location.search);
+    const roomCode = (q.get('room') || '').toUpperCase().slice(0, 12);
+    const purposes = (S.config && S.config.purposes) || [];
+    const wantPurpose = q.get('purpose');
+    const purpose = purposes.some((p) => p.key === wantPurpose) ? wantPurpose : '';
+    appEl().innerHTML = `
+      ${header(t('feedback.title'), { back: roomCode ? `/room/${roomCode}/ended` : '/' })}
+      <main class="max-w-2xl mx-auto px-4 py-5 space-y-5">
+        <p class="text-sm text-zinc-400">${esc(t('feedback.blurb'))}</p>
+        <form id="feedback-form" class="space-y-5">
+          ${roomCode ? `<p class="text-xs text-zinc-600">${esc(t('feedback.fromRoom', { code: roomCode }))}</p>` : ''}
+          <section class="space-y-2">
+            <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('feedback.rating'))}</h2>
+            <div class="flex gap-2" id="rating-row">
+              ${[1, 2, 3, 4, 5].map((n) => `
+                <button type="button" data-rating="${n}"
+                  class="un-pressable flex-1 py-3 rounded-xl bg-zinc-900 ring-1 ring-transparent text-sm">${n}</button>`).join('')}
+            </div>
+          </section>
+          <section class="space-y-2">
+            <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('feedback.purpose'))}</h2>
+            <select id="feedback-purpose" class="w-full px-3 py-3 rounded-xl bg-zinc-900 text-sm outline-none focus:ring-1 focus:ring-violet-500">
+              <option value="">${esc(t('common.none'))}</option>
+              ${purposes.map((p) => `<option value="${esc(p.key)}" ${p.key === purpose ? 'selected' : ''}>${esc(p.label)}</option>`).join('')}
+            </select>
+          </section>
+          <section class="space-y-2">
+            <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('feedback.comment'))}</h2>
+            <textarea id="feedback-comment" rows="5" maxlength="1000"
+              placeholder="${esc(t('feedback.commentPlaceholder'))}"
+              class="w-full px-3 py-3 rounded-xl bg-zinc-900 text-sm placeholder-zinc-600 outline-none focus:ring-1 focus:ring-violet-500"></textarea>
+          </section>
+          <label class="flex items-center gap-3 px-3 py-2.5 rounded-xl bg-zinc-900 text-sm">
+            <input type="checkbox" id="feedback-contact" class="un-switch">
+            <span>${esc(t('feedback.contactOk'))}</span>
+          </label>
+          <button type="submit" id="feedback-submit"
+            class="un-pressable w-full py-3.5 rounded-xl bg-violet-600 text-white font-semibold">${esc(t('feedback.submit'))}</button>
+        </form>
+      </main>`;
+    bindNav(appEl());
+
+    let rating = 0;
+    $$('[data-rating]').forEach((b) => b.addEventListener('click', () => {
+      rating = Number(b.dataset.rating);
+      $$('[data-rating]').forEach((x) => {
+        x.classList.toggle('ring-violet-500', x === b);
+        x.classList.toggle('ring-transparent', x !== b);
+      });
+    }));
+
+    $('#feedback-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!rating) { notify(t('feedback.rating')); return; }
+      const btn = $('#feedback-submit');
+      btn.disabled = true;
+      // The device report is capability flags and counters only. A pilot note
+      // describes the browser it came from, never the conversation.
+      let compat = S.compat;
+      if (!compat) { try { compat = (await probeCompat()).flags; } catch { compat = null; } }
+      try {
+        await api('/api/feedback', {
+          method: 'POST',
+          body: {
+            rating,
+            purpose: $('#feedback-purpose').value || null,
+            comment: $('#feedback-comment').value,
+            contactOk: $('#feedback-contact').checked,
+            roomCode: roomCode || null,
+            compat,
+          },
+        });
+        appEl().innerHTML = `
+          ${header(t('feedback.title'), { back: '/' })}
+          <main class="max-w-2xl mx-auto px-4 py-16 text-center space-y-3">
+            <p class="text-4xl">✅</p>
+            <p class="text-sm text-zinc-400">${esc(t('feedback.thanks'))}</p>
+            <button data-nav="/" class="un-pressable mt-2 px-5 py-2.5 rounded-xl bg-violet-600 text-white text-sm font-medium">${esc(t('common.back'))}</button>
+          </main>`;
+        bindNav(appEl());
+      } catch (err) {
+        btn.disabled = false;
+        notify(err.code === 'rate_limited' ? t('feedback.tooMany') : err.message);
+      }
+    });
+  }
+
+  async function renderAdminFeedback() {
+    appEl().innerHTML = `${header(t('feedback.listTitle'), { back: '/admin/metrics' })}
+      <main class="max-w-2xl mx-auto px-4 py-10 text-center text-sm text-zinc-500">${esc(t('common.loading'))}</main>`;
+    let data;
+    let gated = '';
+    try {
+      data = await api('/api/feedback');
+      // The server withholds the rows with a 200 rather than a 403, so a
+      // non-admin opening this screen does not make the browser log a failed
+      // request on a page that is behaving correctly.
+      if (data && data.adminOnly) gated = t('metrics.adminOnly');
+    } catch (err) {
+      // The list is admin-only on the server and stays that way. The SECTION
+      // still renders, because a screen that vanishes into an error line looks
+      // broken rather than gated, and the reader needs to know which it is.
+      data = { items: [], byPurpose: [], overall: {} };
+      gated = err.status === 403 ? t('metrics.adminOnly') : err.message;
+    }
+    const purposeLabel = (key) => {
+      const p = ((S.config && S.config.purposes) || []).find((x) => x.key === key);
+      return p ? p.label : (key || '—');
+    };
+    const overall = data.overall || {};
+    const items = data.items || [];
+    appEl().innerHTML = `
+      ${header(t('feedback.listTitle'), { back: '/admin/metrics' })}
+      <main class="max-w-2xl mx-auto px-4 py-5 space-y-5">
+        <section class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('feedback.average'))}</h2>
+          <div class="flex items-baseline justify-between gap-3 px-3 py-2.5 rounded-lg bg-zinc-900">
+            <span class="text-sm text-zinc-400">${esc(t('feedback.average'))}</span>
+            <span class="text-sm font-mono">${overall.avg_rating != null ? esc(overall.avg_rating) : '—'} / 5</span>
+            <span class="text-[11px] text-zinc-600">${overall.n || 0}</span>
+          </div>
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500 pt-2">${esc(t('feedback.byPurpose'))}</h2>
+          ${(data.byPurpose || []).map((p) => `
+            <div class="flex items-baseline justify-between gap-3 px-3 py-2.5 rounded-lg bg-zinc-900">
+              <span class="text-sm text-zinc-400">${esc(purposeLabel(p.purpose))}</span>
+              <span class="text-sm font-mono">${p.avg_rating != null ? esc(p.avg_rating) : '—'} / 5</span>
+              <span class="text-[11px] text-zinc-600">${p.n}</span>
+            </div>`).join('')}
+        </section>
+        <section id="feedback-list" class="space-y-2">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('feedback.listTitle'))}</h2>
+          ${gated ? `<p class="text-sm text-zinc-600">${esc(gated)}</p>` : ''}
+          ${items.length ? items.map((it) => `
+            <div class="p-3 rounded-xl bg-zinc-900 space-y-1">
+              <div class="flex items-baseline justify-between gap-3">
+                <span class="text-sm">${esc(it.username || 'anon')}</span>
+                <span class="text-sm font-mono">${it.rating} / 5</span>
+              </div>
+              <p class="text-[11px] text-zinc-600">
+                ${esc(purposeLabel(it.purpose))}${it.room_code ? ` · ${esc(it.room_code)}` : ''}${it.contact_ok ? ' · contact ok' : ''}
+              </p>
+              ${it.comment ? `<p class="text-sm text-zinc-300">${esc(it.comment)}</p>` : ''}
+              ${it.compat ? `<p class="text-[11px] font-mono text-zinc-700 break-all">${esc(JSON.stringify(it.compat))}</p>` : ''}
+            </div>`).join('') : `<p class="text-sm text-zinc-600">${esc(t('feedback.listEmpty'))}</p>`}
+        </section>
+      </main>`;
+    bindNav(appEl());
+  }
+
+  // --- error console -------------------------------------------------------
+  async function renderErrors() {
+    appEl().innerHTML = `${header(t('errors.title'), { back: '/admin/metrics' })}
+      <main class="max-w-2xl mx-auto px-4 py-10 text-center text-sm text-zinc-500">${esc(t('common.loading'))}</main>`;
+    let data;
+    let gated = '';
+    try {
+      data = await api('/api/errors?range=7d');
+      if (data && data.adminOnly) gated = t('metrics.adminOnly');
+    } catch (err) {
+      data = { grouped: [], recent: [] };
+      gated = err.status === 403 ? t('metrics.adminOnly') : err.message;
+    }
+    const grouped = data.grouped || [];
+    const recent = data.recent || [];
+    const sourceLabel = (s) => (s === 'client' ? t('errors.client') : t('errors.server'));
+    const when = (iso) => {
+      try { return new Date(iso).toLocaleString(); } catch { return String(iso || ''); }
+    };
+    appEl().innerHTML = `
+      ${header(t('errors.title'), { back: '/admin/metrics' })}
+      <main class="max-w-2xl mx-auto px-4 py-5 space-y-5">
+        <section id="error-list" class="space-y-1.5">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('errors.title'))}</h2>
+          ${gated ? `<p class="text-sm text-zinc-600">${esc(gated)}</p>` : ''}
+          ${grouped.length ? grouped.map((g) => `
+            <div class="flex items-baseline justify-between gap-3 px-3 py-2.5 rounded-lg bg-zinc-900">
+              <span class="text-sm text-zinc-300 font-mono">${esc(g.code)}</span>
+              <span class="text-[11px] text-zinc-600">${esc(sourceLabel(g.source))}</span>
+              <span class="text-sm font-mono">${g.n}</span>
+            </div>`).join('') : `<p class="text-sm text-zinc-600">${esc(t('errors.none'))}</p>`}
+        </section>
+        <section class="space-y-2">
+          <h2 class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('errors.recent'))}</h2>
+          ${recent.map((e) => `
+            <details class="p-3 rounded-xl bg-zinc-900">
+              <summary class="text-sm cursor-pointer">
+                <span class="font-mono">${esc(e.code)}</span>
+                <span class="text-[11px] text-zinc-600"> · ${esc(sourceLabel(e.source))} · ${esc(when(e.created_at))}</span>
+              </summary>
+              <p class="text-xs text-zinc-400 mt-2">${esc(e.where_at || '')}</p>
+              ${e.message ? `<p class="text-xs text-zinc-500 mt-1">${esc(e.message)}</p>` : ''}
+              ${e.stack_head ? `<pre class="text-[11px] text-zinc-600 mt-1 whitespace-pre-wrap break-all">${esc(e.stack_head)}</pre>` : ''}
+              <p class="text-[11px] text-zinc-700 mt-1 font-mono">
+                ${esc(e.req_id || '')}${e.room_code ? ` · ${esc(e.room_code)}` : ''}
+              </p>
+              ${e.user_agent ? `<p class="text-[11px] text-zinc-700 break-all">${esc(e.user_agent)}</p>` : ''}
+            </details>`).join('') || `<p class="text-sm text-zinc-600">${esc(t('errors.none'))}</p>`}
+        </section>
+      </main>`;
+    bindNav(appEl());
+  }
+
+  // --- the scripted demo call ----------------------------------------------
+  // Entirely client side: no API calls, no rows, no LLM spend. That is why it
+  // is NOT gated on staging — it is not data, it is a rehearsal, and the
+  // "before" screenshot of any later change to it is taken from production.
+  function stopDemo() {
+    for (const id of S.demo.timers) clearTimeout(id);
+    S.demo.timers = [];
+    S.demo.running = false;
+  }
+  function demoLater(fn, ms) {
+    S.demo.timers.push(setTimeout(fn, ms));
+  }
+
+  // The same rule the server applies in lib/segment.js, in miniature: a clause
+  // is only spoken once it can no longer be rewritten.
+  function demoClauses(text) {
+    const parts = String(text).split(/(?<=[,.;!?])\s+/).filter(Boolean);
+    return parts.length ? parts : [String(text)];
+  }
+
+  function demoCardHTML(turn, idx, script) {
+    const sp = script.speakers[turn.speaker] || { name: turn.speaker, flag: '🏳️' };
+    return `
+      <article class="utterance fade-in p-3 rounded-xl bg-zinc-900" data-utterance-id="demo-${idx}">
+        <div class="flex items-center gap-2 text-xs text-zinc-500 mb-1">
+          <span>${sp.flag}</span><span>${esc(sp.name)}</span>
+          <span class="text-zinc-700">${esc(langOf(turn.lang).label)} → ${esc(langOf(turn.targetLang).label)}</span>
+        </div>
+        <p class="original text-sm text-zinc-400">${esc(turn.text)}</p>
+        <p class="translation text-sm mt-1" data-demo-translation="${idx}"></p>
+      </article>`;
+  }
+
+  function renderDemo() {
+    stopDemo();
+    const script = (S.config && S.config.demo) || null;
+    if (!script || !Array.isArray(script.turns) || !script.turns.length) {
+      appEl().innerHTML = `${header(t('lobby.demo'), { back: '/' })}
+        <main class="max-w-2xl mx-auto px-4 py-16 text-center text-sm text-zinc-500">${esc(t('common.none'))}</main>`;
+      bindNav(appEl());
+      return;
+    }
+    const purposeDef = ((S.config && S.config.purposes) || []).find((p) => p.key === script.purpose);
+    appEl().innerHTML = `
+      ${header(t('lobby.demo'), {
+        back: '/',
+        subtitle: purposeDef ? `${purposeDef.icon} ${purposeDef.label}` : '',
+        right: '<span class="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[11px]">Demo</span>',
+      })}
+      <main class="max-w-2xl mx-auto px-4 py-4 space-y-4"
+            style="padding-bottom: calc(2rem + var(--un-safe-inset-bottom, env(safe-area-inset-bottom, 0px)))">
+        <p class="text-sm text-zinc-400">${esc(t('lobby.demoBlurb'))}</p>
+        <div id="feed" class="space-y-2">
+          ${demoCardHTML(script.turns[0], 0, script)}
+        </div>
+        <div class="flex gap-2">
+          <button id="demo-restart" class="un-pressable flex-1 py-3 rounded-xl bg-zinc-900 text-sm">${esc(t('common.retry'))}</button>
+          <button id="start-real-call" data-nav="/" class="un-pressable flex-1 py-3 rounded-xl bg-violet-600 text-white text-sm font-semibold">
+            ${esc(t('lobby.start'))}
+          </button>
+        </div>
+      </main>`;
+    bindNav(appEl());
+    const restart = document.getElementById('demo-restart');
+    if (restart) restart.addEventListener('click', () => renderDemo());
+
+    // The first turn is complete on first paint. Everything after it is
+    // replayed clause by clause on the same code path a real caption takes.
+    const first = script.turns[0];
+    const firstClauses = demoClauses(first.translated);
+    const firstEl = document.querySelector('[data-demo-translation="0"]');
+    if (firstEl) firstEl.textContent = first.translated;
+    demoOffer(0, first, firstClauses, firstClauses.length, true);
+
+    S.demo.running = true;
+    let at = 0;
+    for (let i = 1; i < script.turns.length; i += 1) {
+      const turn = script.turns[i];
+      at += (turn.gapMs || 1200) + (turn.captureMs || 900);
+      const startAt = at;
+      demoLater(() => {
+        const feed = document.getElementById('feed');
+        if (!feed || !S.route || S.route.name !== 'demo') return;
+        feed.insertAdjacentHTML('beforeend', demoCardHTML(turn, i, script));
+      }, startAt);
+      const clauses = demoClauses(turn.translated);
+      const step = Math.max(220, Math.round((turn.translateMs || 600) / clauses.length));
+      for (let cIdx = 0; cIdx < clauses.length; cIdx += 1) {
+        const sealed = cIdx + 1;
+        const final = sealed === clauses.length;
+        at = startAt + (turn.translateMs || 600) + step * cIdx;
+        demoLater(() => {
+          if (!S.route || S.route.name !== 'demo') return;
+          const el = document.querySelector(`[data-demo-translation="${i}"]`);
+          if (!el) return;
+          el.textContent = clauses.slice(0, sealed).join(' ');
+          el.classList.toggle('partial', !final);
+          demoOffer(i, turn, clauses, sealed, final);
+        }, at);
+      }
+    }
+  }
+
+  // The demo speaks through the real bus, so a listener hears exactly what a
+  // real call sounds like — including that only sealed clauses ever go out.
+  function demoOffer(idx, turn, clauses, sealedIdx, final) {
+    if (!Audio) return;
+    try {
+      Audio.offer({
+        utteranceId: `demo-${idx}`,
+        targetLang: turn.targetLang,
+        ttsTag: langOf(turn.targetLang).tts,
+        segments: clauses,
+        sealedIdx,
+        final: !!final,
+        ageMs: 0,
+      });
+    } catch { /* a demo must never break on a device with no voice */ }
   }
 
   // --- render --------------------------------------------------------------
@@ -2005,6 +2715,8 @@
       if (Audio) Audio.reset();
       S.latency.byKey.clear();
       S.offeredSegments.clear();
+      S.translateSamples = [];
+      stopDemo();
       if (route.name !== 'room') {
         S.room = null; S.me = null; S.participants.clear(); S.utterances.clear();
         S.cursor = 0; S.spokenIds.clear();
@@ -2036,6 +2748,18 @@
       await renderEnded();
     } else if (route.name === 'metrics') {
       await renderMetrics();
+    } else if (route.name === 'alerts') {
+      await renderAlerts();
+    } else if (route.name === 'compat') {
+      await renderCompat();
+    } else if (route.name === 'errors') {
+      await renderErrors();
+    } else if (route.name === 'adminFeedback') {
+      await renderAdminFeedback();
+    } else if (route.name === 'feedback') {
+      await renderFeedback();
+    } else if (route.name === 'demo') {
+      renderDemo();
     }
 
     // Re-render it once the route has landed: poll() may have corrected the
@@ -2062,6 +2786,25 @@
     // The bus needs S.config.audio, so it is built after the config lands and
     // before anything can render a mode selector against it.
     ensureAudio();
+
+    // Which language the INTERFACE speaks, resolved once, in this order:
+    // what this person chose inside the app, then their platform-level
+    // setting, then the device, then English. A null platform locale means
+    // "no preference recorded", not "English", which is exactly why it falls
+    // through to the device instead of stopping there.
+    let uiLang = resolveUiLang(S.prefs && S.prefs.uiLang);
+    if (!uiLang && window.usernode && typeof window.usernode.getUserLocale === 'function') {
+      try {
+        const { locale } = await window.usernode.getUserLocale();
+        uiLang = resolveUiLang(locale);
+      } catch { /* standalone: fall through to the device */ }
+    }
+    if (!uiLang) uiLang = resolveUiLang(navigator.language);
+    // `?lang=` is pure client state. It writes nothing and survives no
+    // reload, which is what makes it safe to point a screenshot at.
+    const forced = resolveUiLang(new URLSearchParams(location.search).get('lang'));
+    S.uiLang = forced || uiLang || (S.config && S.config.defaultUiLang) || 'en';
+    document.documentElement.setAttribute('lang', S.uiLang);
 
     // Ask the platform for the user's language preference only when they
     // have not made a choice inside this app. Their in-app choice wins.
@@ -2245,7 +2988,12 @@
       });
     }
 
-    await render();
+    try {
+      await render();
+    } catch (err) {
+      report('boot', err);
+      throw err;
+    }
   }
 
   window.addEventListener('beforeunload', () => {

@@ -1,4 +1,5 @@
 const express = require('express');
+const compression = require('compression');
 const path = require('path');
 const crypto = require('crypto');
 const { Pool } = require('pg');
@@ -15,6 +16,10 @@ const telephony = require('./lib/bridge/telephony');
 const stream = require('./lib/stream');
 const latencyLog = require('./lib/latency');
 const segment = require('./lib/segment');
+const log = require('./lib/log');
+const SLO = require('./lib/slo');
+const { t, STRINGS, UI_LANGS, DEFAULT_UI_LANG, resolveUiLang } = require('./lib/strings');
+const alerts = require('./lib/alerts');
 
 const {
   LANG_CODES, LANG_BY_CODE, PURPOSE_KEYS, LIMITS,
@@ -23,7 +28,31 @@ const {
 
 const app = express();
 const port = process.env.PORT || 3000;
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// Explicit pool bounds. One container, one pool: `max` is the real ceiling on
+// concurrent database work, and a statement timeout means a pathological query
+// releases its connection instead of holding it until the deploy replaces us.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+  // Passed as a connection parameter rather than issued as a `SET` from a
+  // `connect` handler: the handler's query races the pool handing the same
+  // client to whoever was waiting for it, which pg reports as a deprecation
+  // and which would become an error in pg 9. As a parameter the server
+  // applies it during startup, before the client is usable at all.
+  statement_timeout: 5000,
+});
+pool.on('error', (err) => {
+  log.error('pool', { msg: err && err.message });
+});
+
+// Stamped into /health and every boot line so a log can be tied to a build.
+const APP_VERSION = process.env.USERNODE_BUILD_SHA
+  || process.env.GIT_COMMIT
+  || require('./package.json').version
+  || 'dev';
+const STARTED_AT = Date.now();
 
 const IS_STAGING = process.env.USERNODE_ENV === 'staging';
 const PLATFORM_BASE_URL = 'https://social-vibecoding.usernodelabs.org';
@@ -70,8 +99,83 @@ function verifyToken(token) {
 
 const PUBLIC_API_PATHS = new Set(['/health', '/favicon.ico', '/api/config']);
 
+app.use(compression());
 app.use(express.json({ limit: '64kb' }));
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
+
+// --- request identity and access logging -------------------------------------
+// Every request carries an id, echoed back in the header AND in the body of
+// any error. That id is the whole point of the error contract: a user can read
+// it off the screen and someone can grep one line of stdout for it.
+app.use((req, res, next) => {
+  const inbound = String(req.get('x-request-id') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 16);
+  req.id = inbound || crypto.randomUUID().slice(0, 8);
+  res.setHeader('x-request-id', req.id);
+  const started = Date.now();
+  res.on('finish', () => {
+    // The cursor stream is the highest-volume route in the app by an order of
+    // magnitude, so it logs at debug. A held long poll logs once, on finish,
+    // carrying how long it held.
+    const isStream = req.path.startsWith('/api/rooms/') && req.path.endsWith('/stream');
+    const fields = {
+      reqId: req.id,
+      method: req.method,
+      path: req.route ? req.route.path : req.path,
+      status: res.statusCode,
+      ms: Date.now() - started,
+    };
+    if (res.locals.held != null) fields.held = res.locals.held;
+    if (res.locals.roomId != null) fields.roomId = res.locals.roomId;
+    if (isStream) log.debug('http', fields);
+    else if (res.statusCode >= 500) log.error('http', fields);
+    else log.info('http', fields);
+  });
+  next();
+});
+
+// --- the error contract ------------------------------------------------------
+// One shape for every failure: `{ error: <code>, message: <fixed string>,
+// requestId }`. The message is chosen from a table keyed by the code and is
+// never `err.message` — a driver string can name a column, a constraint or a
+// value somebody typed, and none of that is the user's to read or an
+// attacker's to enumerate. The real cause goes to stdout, keyed by requestId.
+// The language to answer a request in. `?lang=` is the client's explicit
+// override (the same switch the interface uses), then the platform locale
+// claim, then English. Reading it costs nothing and it is never persisted.
+function uiLangOf(req) {
+  const q = req && req.query && req.query.lang;
+  if (q && UI_LANGS.includes(String(q))) return String(q);
+  return resolveUiLang(req && req.user && req.user.locale) || DEFAULT_UI_LANG;
+}
+
+function fail(res, req, status, code, cause, vars) {
+  const message = t(uiLangOf(req), `err.${code}`, vars);
+  if (cause) {
+    log[status >= 500 ? 'error' : 'warn']('request_failed', {
+      reqId: req && req.id,
+      path: req && req.path,
+      status,
+      code,
+      msg: cause && cause.message ? cause.message : String(cause),
+      stack: cause && cause.stack ? String(cause.stack).split('\n').slice(1, 3).join(' | ').slice(0, 400) : undefined,
+    });
+    recordError({
+      source: 'server',
+      code,
+      where: req && req.path,
+      message: cause && cause.message ? cause.message : String(cause),
+      stack: cause && cause.stack ? String(cause.stack) : null,
+      reqId: req && req.id,
+      roomId: res.locals && res.locals.roomId,
+    });
+  }
+  if (res.headersSent) return undefined;
+  return res.status(status).json({
+    error: code,
+    message,
+    requestId: req && req.id,
+  });
+}
 
 app.use((req, res, next) => {
   const token = req.query.token || req.headers['x-usernode-token'];
@@ -82,7 +186,7 @@ app.use((req, res, next) => {
   }
   if (req.method !== 'GET' || req.path.startsWith('/api/')) {
     if (PUBLIC_API_PATHS.has(req.path)) return next();
-    if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+    if (!req.user) return fail(res, req, 401, 'not_authenticated');
   }
   next();
 });
@@ -90,9 +194,60 @@ app.use((req, res, next) => {
 // --- helpers ---------------------------------------------------------------
 let shuttingDown = false;
 
-app.get('/health', (_req, res) => {
+// --- health ------------------------------------------------------------------
+// An endpoint that answered `ok` whatever the database was doing was not a
+// health check, it was a liveness check wearing a costume. This one probes the
+// pool, but at most once every five seconds (Docker's HEALTHCHECK runs every
+// 30s and the platform polls too, and a probe that hammers the database to
+// prove the database is fine is its own outage), and it only turns red after
+// THREE consecutive failures so one dropped connection during a failover does
+// not take the container out of rotation.
+const HEALTH_CACHE_MS = 5000;
+const HEALTH_PROBE_TIMEOUT_MS = 800;
+const HEALTH_STRIKES = 3;
+let healthCache = { at: 0, ok: null, error: null };
+let healthStrikes = 0;
+
+async function probeDb() {
+  const now = Date.now();
+  if (healthCache.at && now - healthCache.at < HEALTH_CACHE_MS) return healthCache;
+  let ok = false;
+  let error = null;
+  try {
+    await Promise.race([
+      pool.query('SELECT 1'),
+      new Promise((_r, reject) => {
+        const timer = setTimeout(() => reject(new Error('probe_timeout')), HEALTH_PROBE_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+    ok = true;
+  } catch (err) {
+    error = err && err.message ? String(err.message).slice(0, 80) : 'probe_failed';
+  }
+  if (ok) healthStrikes = 0;
+  else healthStrikes += 1;
+  healthCache = { at: now, ok, error };
+  return healthCache;
+}
+
+app.get('/health', async (_req, res) => {
+  // Leaving comes first: anything polling readiness must see us go out of
+  // rotation before the drain, not after.
   if (shuttingDown) return res.status(503).json({ status: 'shutting_down' });
-  res.json({ status: 'ok' });
+  const db = await probeDb();
+  const unhealthy = !db.ok && healthStrikes >= HEALTH_STRIKES;
+  res.status(unhealthy ? 503 : 200).json({
+    status: unhealthy ? 'unhealthy' : (db.ok ? 'ok' : 'degraded'),
+    env: process.env.USERNODE_ENV || 'production',
+    version: APP_VERSION,
+    uptimeS: Math.round((Date.now() - STARTED_AT) / 1000),
+    db: db.ok ? 'ok' : `failing (${healthStrikes})`,
+    llm: translator.LLM_ENABLED ? 'ok' : 'absent',
+    engine: translator.activeEngineId(),
+    queueDepth: translator.queueDepth ? translator.queueDepth() : null,
+    translationSessions: translator.sessionCount(),
+  });
 });
 
 const ROOM_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no O/0/I/1
@@ -108,8 +263,24 @@ function normLang(value, fallback) {
   return LANG_CODES.includes(v) ? v : fallback;
 }
 
+// App admins come from the `LT_ADMIN_USERNAMES` manifest secret: a
+// comma-separated list of platform usernames. The old version read
+// `is_admin` / `role` off the JWT, and the platform token carries neither, so
+// it could never return true and every admin gate in the app was decorative.
+//
+// Usernames are public identifiers (every one is a route key on the platform),
+// so the secret is declared non-private. An empty list means nobody, on
+// purpose: an admin gate that fails open is not a gate.
+const ADMIN_USERNAMES = new Set(
+  String(process.env.LT_ADMIN_USERNAMES || '')
+    .split(',')
+    .map((n) => n.trim().toLowerCase())
+    .filter(Boolean)
+);
+
 function isAdmin(user) {
-  return !!(user && (user.is_admin || user.admin || user.role === 'admin'));
+  if (!user || !user.username) return false;
+  return ADMIN_USERNAMES.has(String(user.username).toLowerCase());
 }
 
 async function bumpSeq(client, roomId) {
@@ -150,6 +321,34 @@ async function rateAllows(scope, key, limit, windowSql) {
     [scope, String(key)]
   );
   return true;
+}
+
+// --- the error table ---------------------------------------------------------
+// There is no external error tracker to ship to, and no way to request one, so
+// the app keeps its own. The table is `staging:private`: a stack head or a
+// message can quote a path, a room or a fragment of what somebody typed.
+//
+// Writing is fire and forget by design. An error while recording an error must
+// never become the response a user sees, and a retry loop on the error channel
+// is how a small problem becomes an outage.
+function recordError(entry) {
+  const e = entry || {};
+  const stack = e.stack ? String(e.stack).split('\n').slice(0, 3).join(' | ') : null;
+  pool.query(
+    `INSERT INTO error_events
+       (source, code, where_at, message, stack_head, user_agent, room_id, req_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+    [
+      e.source === 'client' ? 'client' : 'server',
+      String(e.code || 'unknown').slice(0, 48),
+      e.where ? String(e.where).slice(0, 64) : null,
+      e.message ? String(e.message).slice(0, 300) : null,
+      stack ? stack.slice(0, 500) : null,
+      e.userAgent ? String(e.userAgent).slice(0, 200) : null,
+      e.roomId || null,
+      e.reqId ? String(e.reqId).slice(0, 16) : null,
+    ]
+  ).catch(() => {});
 }
 
 // A room's tier decides its participant cap, how many people may hold the
@@ -250,7 +449,11 @@ function publicParticipant(p) {
 }
 
 // --- config ----------------------------------------------------------------
-app.get('/api/config', (_req, res) => {
+app.get('/api/config', (req, res) => {
+  // Config changes only on deploy, and the client fetches it on every boot.
+  // Five minutes of freshness costs nothing and takes the request off the
+  // critical path for anyone reloading a room.
+  res.setHeader('Cache-Control', 'public, max-age=300');
   res.json({
     languages: CONFIG.LANGUAGES,
     comingSoon: CONFIG.COMING_SOON,
@@ -263,8 +466,17 @@ app.get('/api/config', (_req, res) => {
     audio: CONFIG.AUDIO,
     llmEnabled: translator.LLM_ENABLED,
     engine: translator.activeEngineId(),
-    dialIn: telephony.status(),
+    dialIn: telephony.status(uiLangOf(req)),
     env: process.env.USERNODE_ENV || 'production',
+    // The whole string table, both languages, so the browser can switch
+    // interface language without a round trip and client and server cannot
+    // drift on a label. Same reasoning as every other constant here.
+    strings: STRINGS,
+    uiLangs: UI_LANGS,
+    defaultUiLang: DEFAULT_UI_LANG,
+    slo: { targets: SLO.TARGETS, rates: SLO.RATES, minSamples: SLO.MIN_SAMPLES },
+    demo: CONFIG.DEMO_SCRIPT,
+    version: APP_VERSION,
   });
 });
 
@@ -305,6 +517,7 @@ app.get('/api/me/prefs', async (req, res) => {
           hearsLang: p.hears_lang,
           audioMode: normAudioMode(p.audio_mode, CONFIG.AUDIO.DEFAULT_MODE),
           ttsEnabled: p.tts_enabled,
+          uiLang: p.ui_lang || null,
           isDefault: false,
         },
       });
@@ -321,11 +534,16 @@ app.get('/api/me/prefs', async (req, res) => {
         hearsLang: guess,
         audioMode: CONFIG.AUDIO.DEFAULT_MODE,
         ttsEnabled: ttsFromMode(CONFIG.AUDIO.DEFAULT_MODE),
+        // The interface language is deliberately NOT guessed here. `null` is
+        // "no stored preference", and the browser resolves it against the
+        // platform locale and then the device — a guess written into the row
+        // would make those two later sources unreachable forever.
+        uiLang: null,
         isDefault: true,
       },
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   }
 });
 
@@ -334,7 +552,7 @@ app.put('/api/me/prefs', async (req, res) => {
   const hears = normLang(req.body && req.body.hearsLang, 'en');
   try {
     const { rows: existing } = await pool.query(
-      'SELECT audio_mode FROM user_language_prefs WHERE user_id = $1',
+      'SELECT audio_mode, ui_lang FROM user_language_prefs WHERE user_id = $1',
       [req.user.id]
     );
     const audioMode = audioModeFromBody(
@@ -342,24 +560,29 @@ app.put('/api/me/prefs', async (req, res) => {
       existing.length ? existing[0].audio_mode : CONFIG.AUDIO.DEFAULT_MODE
     );
     const tts = ttsFromMode(audioMode);
+    // Only a language the interface actually ships is stored. An unshipped tag
+    // would pin the user to a fallback with no way back to auto-detection.
+    const uiLang = req.body && Object.prototype.hasOwnProperty.call(req.body, 'uiLang')
+      ? (UI_LANGS.includes(String(req.body.uiLang)) ? String(req.body.uiLang) : null)
+      : (existing.length ? existing[0].ui_lang : null);
     await pool.query(
       `INSERT INTO user_language_prefs
-         (user_id, username, speaks_lang, hears_lang, tts_enabled, audio_mode, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,NOW())
+         (user_id, username, speaks_lang, hears_lang, tts_enabled, audio_mode, ui_lang, updated_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
        ON CONFLICT (user_id) DO UPDATE
          SET username = EXCLUDED.username, speaks_lang = EXCLUDED.speaks_lang,
              hears_lang = EXCLUDED.hears_lang, tts_enabled = EXCLUDED.tts_enabled,
-             audio_mode = EXCLUDED.audio_mode,
+             audio_mode = EXCLUDED.audio_mode, ui_lang = EXCLUDED.ui_lang,
              updated_at = NOW()`,
-      [req.user.id, req.user.username, speaks, hears, tts, audioMode]
+      [req.user.id, req.user.username, speaks, hears, tts, audioMode, uiLang]
     );
     res.json({
       prefs: {
-        speaksLang: speaks, hearsLang: hears, audioMode, ttsEnabled: tts, isDefault: false,
+        speaksLang: speaks, hearsLang: hears, audioMode, ttsEnabled: tts, uiLang, isDefault: false,
       },
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   }
 });
 
@@ -385,7 +608,7 @@ app.get('/api/rooms/mine', async (req, res) => {
       rooms: rows.map((r) => ({ ...publicRoom(r), liveCount: r.live_count })),
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   }
 });
 
@@ -408,13 +631,10 @@ app.post('/api/rooms', async (req, res) => {
 
   try {
     if (!await rateAllows('room_create', req.user.id, LIMITS.ROOMS_PER_HOUR_PER_USER, '1 hour')) {
-      return res.status(429).json({
-        error: 'rate_limited',
-        message: `You can start ${LIMITS.ROOMS_PER_HOUR_PER_USER} calls per hour.`,
-      });
+      return fail(res, req, 429, 'too_many_rooms', null, { n: LIMITS.ROOMS_PER_HOUR_PER_USER });
     }
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    return fail(res, req, 500, 'internal', err);
   }
 
   const client = await pool.connect();
@@ -443,11 +663,11 @@ app.post('/api/rooms', async (req, res) => {
     // A room is a durable address; the SITTING is what accrues cost. Opening
     // the ledger row is best-effort — a dashboard is never worth a failed call.
     cost.startSession(pool, room.id, scaleTier, translator.activeEngineId())
-      .catch((err) => console.error('[cost] session open failed', err.message));
+      .catch((err) => log.error('cost', { detail: 'session open failed', msg: err.message }));
     res.json({ room: publicRoom(room) });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   } finally {
     client.release();
   }
@@ -456,6 +676,12 @@ app.post('/api/rooms', async (req, res) => {
 app.post('/api/rooms/:code/join', async (req, res) => {
   const speaks = normLang(req.body && req.body.speaksLang, 'en');
   const hears = normLang(req.body && req.body.hearsLang, 'en');
+  // Joining is cheap for the caller and not for us: each attempt takes a row
+  // lock on the room and recounts the roster. Twenty a minute is far more than
+  // a person switching languages needs and far less than a loop can spend.
+  if (!(await rateAllows('join', `user:${req.user.id}`, 20, '1 minute'))) {
+    return fail(res, req, 429, 'rate_limited');
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -464,8 +690,8 @@ app.post('/api/rooms/:code/join', async (req, res) => {
       [String(req.params.code || '').toUpperCase()]
     );
     const room = roomRows[0];
-    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
-    if (room.ended_at) { await client.query('ROLLBACK'); return res.status(410).json({ error: 'room_ended' }); }
+    if (!room) { await client.query('ROLLBACK'); return fail(res, req, 404, 'room_not_found'); }
+    if (room.ended_at) { await client.query('ROLLBACK'); return fail(res, req, 410, 'room_ended'); }
 
     const existing = await client.query(
       'SELECT * FROM room_participants WHERE room_id = $1 AND user_id = $2',
@@ -473,7 +699,7 @@ app.post('/api/rooms/:code/join', async (req, res) => {
     );
     if (existing.rows.length && existing.rows[0].removed) {
       await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'removed_by_host' });
+      return fail(res, req, 403, 'removed_by_host');
     }
 
     if (!existing.rows.length) {
@@ -495,7 +721,9 @@ app.post('/api/rooms/:code/join', async (req, res) => {
           error: 'room_full',
           tier: tier.key,
           max: peopleCap,
-          message: `This ${tier.label.toLowerCase()} holds ${peopleCap} people. The host can move it to a larger room.`,
+          message: t(uiLangOf(req), 'err.room_full_tier',
+            { tier: tier.label.toLowerCase(), n: peopleCap }),
+          requestId: req.id,
         });
       }
       const distinct = await client.query(
@@ -512,7 +740,9 @@ app.post('/api/rooms/:code/join', async (req, res) => {
         return res.status(409).json({
           error: 'too_many_languages',
           max: langCap,
-          message: `This call already carries ${langCap} listening languages, the maximum for a ${tier.label.toLowerCase()}.`,
+          message: t(uiLangOf(req), 'err.too_many_languages_tier',
+            { n: langCap, tier: tier.label.toLowerCase() }),
+          requestId: req.id,
         });
       }
     }
@@ -536,7 +766,7 @@ app.post('/api/rooms/:code/join', async (req, res) => {
     res.json({ room: publicRoom(room), joined: true });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   } finally {
     client.release();
   }
@@ -552,14 +782,14 @@ app.patch('/api/rooms/:code/me', async (req, res) => {
       [String(req.params.code || '').toUpperCase()]
     );
     const room = roomRows[0];
-    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
+    if (!room) { await client.query('ROLLBACK'); return fail(res, req, 404, 'room_not_found'); }
 
     const { rows: meRows } = await client.query(
       'SELECT * FROM room_participants WHERE room_id = $1 AND user_id = $2',
       [room.id, req.user.id]
     );
     const me = meRows[0];
-    if (!me || me.removed) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'not_a_member' }); }
+    if (!me || me.removed) { await client.query('ROLLBACK'); return fail(res, req, 403, 'not_a_member'); }
 
     const b = req.body || {};
     const speaks = b.speaksLang === undefined ? me.speaks_lang : normLang(b.speaksLang, me.speaks_lang);
@@ -578,7 +808,8 @@ app.patch('/api/rooms/:code/me', async (req, res) => {
         return res.status(409).json({
           error: 'too_many_languages',
           max: langCap,
-          message: `This call already carries ${langCap} listening languages, the maximum.`,
+          message: t(uiLangOf(req), 'err.too_many_languages', { n: langCap }),
+          requestId: req.id,
         });
       }
     }
@@ -617,7 +848,7 @@ app.patch('/api/rooms/:code/me', async (req, res) => {
       backfilling = Math.min(CONFIG.LATENCY.BACKFILL_UTTERANCES, 5);
       if (await rateAllows('lang_switch', `user:${req.user.id}`, 3, '1 minute')) {
         backfillForListener(room, hears, req.user.id, req.userToken)
-          .catch((err) => console.error('[backfill]', err.message));
+          .catch((err) => log.error('backfill', { roomId: room.id, msg: err.message }));
       } else {
         backfilling = 0;
       }
@@ -626,7 +857,7 @@ app.patch('/api/rooms/:code/me', async (req, res) => {
     res.json({ ok: true, seq, backfilling });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   } finally {
     client.release();
   }
@@ -635,7 +866,7 @@ app.patch('/api/rooms/:code/me', async (req, res) => {
 // Host moderation: promote/demote, mute, remove. (Stage 3 roles + Stage 7.)
 app.patch('/api/rooms/:code/participants/:userId', async (req, res) => {
   const targetId = parseInt(req.params.userId, 10);
-  if (!Number.isFinite(targetId)) return res.status(400).json({ error: 'bad_user_id' });
+  if (!Number.isFinite(targetId)) return fail(res, req, 400, 'bad_user_id');
 
   const client = await pool.connect();
   try {
@@ -645,14 +876,14 @@ app.patch('/api/rooms/:code/participants/:userId', async (req, res) => {
       [String(req.params.code || '').toUpperCase()]
     );
     const room = roomRows[0];
-    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
+    if (!room) { await client.query('ROLLBACK'); return fail(res, req, 404, 'room_not_found'); }
     if (room.host_user_id !== req.user.id) {
       await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'host_only' });
+      return fail(res, req, 403, 'host_only');
     }
     if (targetId === req.user.id) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ error: 'cannot_moderate_self' });
+      return fail(res, req, 400, 'cannot_moderate_self');
     }
 
     const { rows: tRows } = await client.query(
@@ -660,7 +891,7 @@ app.patch('/api/rooms/:code/participants/:userId', async (req, res) => {
       [room.id, targetId]
     );
     const target = tRows[0];
-    if (!target) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_a_member' }); }
+    if (!target) { await client.query('ROLLBACK'); return fail(res, req, 404, 'not_a_member'); }
 
     const b = req.body || {};
     const role = ['agent', 'audience'].includes(b.role) ? b.role : target.role;
@@ -682,7 +913,7 @@ app.patch('/api/rooms/:code/participants/:userId', async (req, res) => {
     res.json({ ok: true, seq });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   } finally {
     client.release();
   }
@@ -701,10 +932,10 @@ app.post('/api/rooms/:code/mode', async (req, res) => {
       [String(req.params.code || '').toUpperCase()]
     );
     const room = rows[0];
-    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
+    if (!room) { await client.query('ROLLBACK'); return fail(res, req, 404, 'room_not_found'); }
     if (room.host_user_id !== req.user.id) {
       await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'host_only' });
+      return fail(res, req, 403, 'host_only');
     }
     const seq = await bumpSeq(client, room.id);
     await client.query('UPDATE rooms SET mode = $2 WHERE id = $1', [room.id, mode]);
@@ -712,7 +943,7 @@ app.post('/api/rooms/:code/mode', async (req, res) => {
     res.json({ ok: true, mode, seq });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   } finally {
     client.release();
   }
@@ -728,7 +959,7 @@ app.post('/api/rooms/:code/mode', async (req, res) => {
 // that question that is not rude.
 app.post('/api/rooms/:code/tier', async (req, res) => {
   const wanted = req.body && req.body.scaleTier;
-  if (!TIER_KEYS.includes(wanted)) return res.status(400).json({ error: 'bad_tier' });
+  if (!TIER_KEYS.includes(wanted)) return fail(res, req, 400, 'bad_tier');
 
   const client = await pool.connect();
   try {
@@ -738,12 +969,12 @@ app.post('/api/rooms/:code/tier', async (req, res) => {
       [String(req.params.code || '').toUpperCase()]
     );
     const room = rows[0];
-    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
+    if (!room) { await client.query('ROLLBACK'); return fail(res, req, 404, 'room_not_found'); }
     if (room.host_user_id !== req.user.id) {
       await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'host_only' });
+      return fail(res, req, 403, 'host_only');
     }
-    if (room.ended_at) { await client.query('ROLLBACK'); return res.status(410).json({ error: 'room_ended' }); }
+    if (room.ended_at) { await client.query('ROLLBACK'); return fail(res, req, 410, 'room_ended'); }
 
     const current = tierFor(room);
     // TIER_KEYS is ordered smallest to largest, so the comparison is the index.
@@ -751,8 +982,9 @@ app.post('/api/rooms/:code/tier', async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({
         error: 'cannot_shrink_tier',
-        message: 'A room can grow mid-call but cannot shrink — nobody gets ejected.',
+        message: t(uiLangOf(req), 'err.cannot_shrink_tier'),
         current: current.key,
+        requestId: req.id,
       });
     }
 
@@ -765,7 +997,7 @@ app.post('/api/rooms/:code/tier', async (req, res) => {
     res.json({ ok: true, room: publicRoom(updated[0]), seq });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   } finally {
     client.release();
   }
@@ -785,15 +1017,15 @@ app.post('/api/rooms/:code/floor', async (req, res) => {
       [String(req.params.code || '').toUpperCase()]
     );
     const room = roomRows[0];
-    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
+    if (!room) { await client.query('ROLLBACK'); return fail(res, req, 404, 'room_not_found'); }
 
     const { rows: meRows } = await client.query(
       'SELECT * FROM room_participants WHERE room_id = $1 AND user_id = $2',
       [room.id, req.user.id]
     );
     const me = meRows[0];
-    if (!me || me.removed) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'not_a_member' }); }
-    if (me.muted_by_host) { await client.query('ROLLBACK'); return res.status(403).json({ error: 'muted_by_host' }); }
+    if (!me || me.removed) { await client.query('ROLLBACK'); return fail(res, req, 403, 'not_a_member'); }
+    if (me.muted_by_host) { await client.query('ROLLBACK'); return fail(res, req, 403, 'muted_by_host'); }
 
     if (wantsRelease) {
       await floor.release(client, room.id, req.user.id);
@@ -840,7 +1072,7 @@ app.post('/api/rooms/:code/floor', async (req, res) => {
     res.json({ ok: true, holder: req.user.id, until: result.until, activeSpeakers: holders, seq });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   } finally {
     client.release();
   }
@@ -854,11 +1086,11 @@ app.post('/api/rooms/:code/floor', async (req, res) => {
 app.post('/api/rooms/:code/dial-in', async (req, res) => {
   try {
     const room = await findRoom(req.params.code);
-    if (!room) return res.status(404).json({ error: 'room_not_found' });
+    if (!room) return fail(res, req, 404, 'room_not_found');
     const result = await telephony.requestDialIn(room);
     res.status(501).json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   }
 });
 
@@ -884,7 +1116,7 @@ async function fanOutTranslations(room, utterance, userToken, opts) {
       speakerHoldsFloor: !!options.speakerHoldsFloor,
     });
   } catch (err) {
-    console.error('[translate] could not resolve targets:', err.message);
+    log.error('translate', { roomId: room.id, detail: 'could not resolve targets', msg: err.message });
     return;
   }
 
@@ -893,8 +1125,10 @@ async function fanOutTranslations(room, utterance, userToken, opts) {
   if (!targets.length && degrade !== 'normal') {
     // Degrading is not silence: the transcript still flows, and the room is
     // told why the captions stopped rather than being left to guess.
-    console.log(`[translate] room=${room.id} tier=${tier.key} src=${utterance.source_lang} `
-      + `groups=${groups.length} status=shed code=${degrade}`);
+    log.info('translate', {
+      roomId: room.id, tier: tier.key, src: utterance.source_lang,
+      groups: groups.length, status: 'shed', code: degrade, traceId: utterance.trace_id || undefined,
+    });
   }
 
   for (const group of targets) {
@@ -933,7 +1167,7 @@ async function translateInto(room, utterance, target, groupSize, userToken, ctx)
         client.release();
       }
     } catch (err) {
-      console.error('[translate] pending insert failed:', err.message);
+      log.error('translate', { roomId: room.id, target, detail: 'pending insert failed', msg: err.message });
       return;
     }
     // Someone already placed this caption (a re-fan-out, or a backfill racing
@@ -952,6 +1186,8 @@ async function translateInto(room, utterance, target, groupSize, userToken, ctx)
         targetLang: target,
         sourceText: utterance.source_text,
         userToken,
+        // Tier shapes how much conversation history rides along on the prompt.
+        tier: tier.key,
         // Delta captions: a provisional caption is written as the model
         // writes, so a listener starts reading before the sentence is done.
         onPartial: (partial) => {
@@ -995,14 +1231,20 @@ async function translateInto(room, utterance, target, groupSize, userToken, ctx)
             `UPDATE utterance_translations
              SET text=$3, status=$4, latency_ms=$5, ttft_ms=$6, seq=$7,
                  group_size=$8, engine_id=$9, finalized_at=NOW(),
-                 segments=$10::jsonb, sealed_idx=$11,
+                 segments=$10::jsonb, sealed_idx=$11, fail_code=$12,
                  first_segment_at = COALESCE(first_segment_at, CASE WHEN $11 > 0 THEN NOW() END)
              WHERE utterance_id=$1 AND target_lang=$2`,
             [utterance.id, target,
               retracted ? null : result.text,
               retracted ? 'retracted' : result.status,
               result.latencyMs, result.ttftMs, seq, groupSize, engineId,
-              JSON.stringify(sealed.segments), sealed.segments.length]
+              JSON.stringify(sealed.segments), sealed.segments.length,
+              // Why it failed, kept on the row. A grey caption used to be
+              // indistinguishable from every other grey caption, so the
+              // metrics screen could count failures but never explain them.
+              (result.status === 'error' || result.status === 'unavailable')
+                ? String(result.code || 'unknown').slice(0, 32)
+                : null]
           );
           await client.query('COMMIT');
         } catch (e) {
@@ -1012,17 +1254,20 @@ async function translateInto(room, utterance, target, groupSize, userToken, ctx)
           client.release();
         }
       } catch (err) {
-        console.error('[translate] result write failed:', err.message);
+        log.error('translate', { roomId: room.id, target, detail: 'result write failed', msg: err.message });
       }
 
       // One structured line per call, with no utterance content in it — this
       // is the monitoring surface, not a transcript log.
-      console.log(`[translate] room=${room.id} tier=${tier.key} src=${utterance.source_lang} `
-        + `tgt=${target} group=${groupSize} status=${result.status} `
-        + `ttft=${result.ttftMs == null ? '-' : result.ttftMs} `
-        + `lat=${result.latencyMs == null ? '-' : result.latencyMs} `
-        + `code=${result.code || '-'} degrade=${degrade} `
-        + `cap=${tier.maxTargetLangs} capture=${utterance.capture_ms == null ? '-' : utterance.capture_ms}`);
+      log[result.status === 'ok' ? 'info' : 'warn']('translate', {
+        roomId: room.id, tier: tier.key, src: utterance.source_lang, tgt: target,
+        group: groupSize, status: result.status,
+        ttft: result.ttftMs == null ? undefined : result.ttftMs,
+        ms: result.latencyMs == null ? undefined : result.latencyMs,
+        code: result.code || undefined, degrade, cap: tier.maxTargetLangs,
+        capture: utterance.capture_ms == null ? undefined : utterance.capture_ms,
+        traceId: utterance.trace_id || undefined,
+      });
 
       return result;
     });
@@ -1103,7 +1348,7 @@ async function backfillForListener(room, targetLang, listenerUserId, userToken) 
     );
     rows = r.rows;
   } catch (err) {
-    console.error('[backfill] lookup failed:', err.message);
+    log.error('backfill', { roomId: room.id, msg: err.message });
     return 0;
   }
 
@@ -1112,7 +1357,7 @@ async function backfillForListener(room, targetLang, listenerUserId, userToken) 
     translateInto(room, utterance, targetLang, 1, userToken, { tier, degrade, engineId });
   }
   if (rows.length) {
-    console.log(`[backfill] room=${room.id} tgt=${targetLang} n=${rows.length}`);
+    log.info('backfill', { roomId: room.id, tgt: targetLang, n: rows.length });
   }
   return rows.length;
 }
@@ -1125,17 +1370,23 @@ async function backfillForListener(room, targetLang, listenerUserId, userToken) 
 app.post('/api/rooms/:code/latency', async (req, res) => {
   try {
     const room = await findRoom(req.params.code);
-    if (!room) return res.status(404).json({ error: 'Room not found', code: 'room_not_found' });
+    if (!room) return fail(res, req, 404, 'room_not_found');
     if (!(await rateAllows('latency', `user:${req.user.id}`, 30, '1 minute'))) {
       // Telemetry is never worth an error the user has to read.
       return res.json({ ok: true, written: 0, throttled: true });
     }
-    const written = await latencyLog.record(
+    const { written, traces } = await latencyLog.record(
       pool, room.id, tierFor(room).key, req.body && req.body.samples
     );
+    if (written) {
+      log.debug('latency', {
+        reqId: req.id, roomId: room.id, tier: tierFor(room).key,
+        n: written, traceId: traces.slice(0, 8).join(',') || undefined,
+      });
+    }
     res.json({ ok: true, written });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   }
 });
 
@@ -1149,26 +1400,34 @@ app.post('/api/rooms/:code/utterances', async (req, res) => {
   const rawCapture = Number(req.body && req.body.captureMs);
   const captureMs = via === 'voice' && Number.isFinite(rawCapture)
     && rawCapture >= 0 && rawCapture <= 120000 ? Math.round(rawCapture) : null;
-  if (!text) return res.status(400).json({ error: 'empty_text' });
+  // A trace id the browser mints per sentence. It only ever appears in logs,
+  // so an opaque short token is the whole contract: anything longer, or with
+  // punctuation in it, is truncated rather than trusted.
+  const traceId = String((req.body && req.body.traceId) || '').replace(/[^A-Za-z0-9]/g, '').slice(0, 16) || null;
+  if (!text) return fail(res, req, 400, 'empty_text');
   if (text.length > LIMITS.MAX_UTTERANCE_CHARS) {
-    return res.status(400).json({ error: 'too_long', max: LIMITS.MAX_UTTERANCE_CHARS });
+    return fail(res, req, 400, 'too_long');
   }
 
   try {
     const room = await findRoom(req.params.code);
-    if (!room) return res.status(404).json({ error: 'room_not_found' });
-    if (room.ended_at) return res.status(410).json({ error: 'room_ended' });
+    if (!room) return fail(res, req, 404, 'room_not_found');
+    if (room.ended_at) return fail(res, req, 410, 'room_ended');
 
     const me = await getParticipant(room.id, req.user.id);
-    if (!me || me.removed || me.left_at) return res.status(403).json({ error: 'not_a_member' });
-    if (me.muted_by_host) return res.status(403).json({ error: 'muted_by_host' });
+    if (!me || me.removed || me.left_at) return fail(res, req, 403, 'not_a_member');
+    if (me.muted_by_host) return fail(res, req, 403, 'muted_by_host');
     // Stage 3: in a one-way room only the host and promoted agents speak.
     if (!room.two_way && me.role === 'audience') {
-      return res.status(403).json({ error: 'listen_only', message: 'Raise your hand to ask for the floor.' });
+      return res.status(403).json({
+        error: 'listen_only', message: t(uiLangOf(req), 'err.listen_only'), requestId: req.id,
+      });
     }
 
     if (!await rateAllows('utterance', `room:${room.id}`, LIMITS.UTTERANCES_PER_MIN_PER_ROOM, '1 minute')) {
-      return res.status(429).json({ error: 'rate_limited', message: 'This call is producing captions faster than we can translate them.' });
+      return res.status(429).json({
+        error: 'rate_limited', message: t(uiLangOf(req), 'err.captions_behind'), requestId: req.id,
+      });
     }
 
     const sourceLang = normLang(req.body && req.body.sourceLang, me.speaks_lang);
@@ -1180,9 +1439,9 @@ app.post('/api/rooms/:code/utterances', async (req, res) => {
       const seq = await bumpSeq(client, room.id);
       const { rows } = await client.query(
         `INSERT INTO utterances
-           (room_id, speaker_user_id, speaker_username, source_lang, source_text, via, seq, capture_ms)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-        [room.id, req.user.id, req.user.username, sourceLang, text, via, seq, captureMs]
+           (room_id, speaker_user_id, speaker_username, source_lang, source_text, via, seq, capture_ms, trace_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+        [room.id, req.user.id, req.user.username, sourceLang, text, via, seq, captureMs, traceId]
       );
       utterance = rows[0];
       await client.query(
@@ -1205,12 +1464,12 @@ app.post('/api/rooms/:code/utterances', async (req, res) => {
     if (room.mode !== 'transcript_only') {
       const holdsFloor = await floor.holdsFloor(pool, room.id, req.user.id).catch(() => false);
       fanOutTranslations(room, utterance, req.userToken, { speakerHoldsFloor: holdsFloor })
-        .catch((err) => console.error('[translate] fan-out failed:', err.message));
+        .catch((err) => log.error('translate', { detail: 'fan-out failed', msg: err.message }));
     }
 
     res.json({ utterance: { id: Number(utterance.id), seq: Number(utterance.seq) } });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   }
 });
 
@@ -1223,18 +1482,18 @@ app.post('/api/rooms/:code/utterances/:id/retract', async (req, res) => {
       [String(req.params.code || '').toUpperCase()]
     );
     const room = roomRows[0];
-    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
+    if (!room) { await client.query('ROLLBACK'); return fail(res, req, 404, 'room_not_found'); }
 
     const { rows: uRows } = await client.query(
       'SELECT * FROM utterances WHERE id = $1 AND room_id = $2',
       [parseInt(req.params.id, 10) || 0, room.id]
     );
     const utt = uRows[0];
-    if (!utt) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'not_found' }); }
+    if (!utt) { await client.query('ROLLBACK'); return fail(res, req, 404, 'not_found'); }
     // Your own words, or the host's room.
     if (utt.speaker_user_id !== req.user.id && room.host_user_id !== req.user.id) {
       await client.query('ROLLBACK');
-      return res.status(403).json({ error: 'not_yours' });
+      return fail(res, req, 403, 'not_yours');
     }
 
     const seq = await bumpSeq(client, room.id);
@@ -1243,7 +1502,7 @@ app.post('/api/rooms/:code/utterances/:id/retract', async (req, res) => {
     res.json({ ok: true, seq });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   } finally {
     client.release();
   }
@@ -1252,19 +1511,19 @@ app.post('/api/rooms/:code/utterances/:id/retract', async (req, res) => {
 app.post('/api/rooms/:code/utterances/:id/report', async (req, res) => {
   try {
     const room = await findRoom(req.params.code);
-    if (!room) return res.status(404).json({ error: 'room_not_found' });
+    if (!room) return fail(res, req, 404, 'room_not_found');
     const me = await getParticipant(room.id, req.user.id);
-    if (!me) return res.status(403).json({ error: 'not_a_member' });
+    if (!me) return fail(res, req, 403, 'not_a_member');
 
     const { rows } = await pool.query(
       'SELECT * FROM utterances WHERE id = $1 AND room_id = $2',
       [parseInt(req.params.id, 10) || 0, room.id]
     );
     const utt = rows[0];
-    if (!utt) return res.status(404).json({ error: 'not_found' });
+    if (!utt) return fail(res, req, 404, 'not_found');
 
     if (!await rateAllows('report', req.user.id, 10, '1 hour')) {
-      return res.status(429).json({ error: 'rate_limited' });
+      return fail(res, req, 429, 'rate_limited');
     }
     await pool.query(
       `INSERT INTO reports (room_id, utterance_id, reporter_user_id, reported_user_id, reported_username, quoted_text, reason)
@@ -1274,7 +1533,7 @@ app.post('/api/rooms/:code/utterances/:id/report', async (req, res) => {
     );
     res.json({ ok: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   }
 });
 
@@ -1316,11 +1575,18 @@ app.get('/api/rooms/:code/stream', async (req, res) => {
       room = fresh;
     }
 
-    const payload = await stream.assemble(STREAM_DEPS, { room, user: req.user, since });
+    const payload = await stream.assemble(
+      { ...STREAM_DEPS, uiLang: uiLangOf(req) },
+      { room, user: req.user, since }
+    );
     payload.held = held;
+    // Surfaced so the access log and the device-check screen can both see
+    // whether this request actually held, and for how long.
+    res.locals.held = held;
+    res.locals.roomId = room.id;
     res.json(payload);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   }
 });
 
@@ -1334,7 +1600,7 @@ app.post('/api/rooms/:code/leave', async (req, res) => {
       [String(req.params.code || '').toUpperCase()]
     );
     const room = roomRows[0];
-    if (!room) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'room_not_found' }); }
+    if (!room) { await client.query('ROLLBACK'); return fail(res, req, 404, 'room_not_found'); }
 
     const seq = await bumpSeq(client, room.id);
     await client.query(
@@ -1363,7 +1629,7 @@ app.post('/api/rooms/:code/leave', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     await client.query('ROLLBACK');
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   } finally {
     client.release();
   }
@@ -1385,14 +1651,177 @@ app.get('/api/rooms/:code/summary', async (req, res) => {
     );
     res.json({ room: publicRoom(room), summary: rows[0] });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
+  }
+});
+
+// --- errors, alerts and pilot feedback (Stage 5/6) ---------------------------
+
+// The browser's error channel. It must be an HTTP POST and never a
+// `console.error`: the platform's baseline proposal check fails any route that
+// logs a console error, so an app that reported its own client failures to the
+// console would fail its own merge gate every time something went wrong.
+app.post('/api/errors', async (req, res) => {
+  try {
+    if (!(await rateAllows('client_error', `user:${req.user.id}`, 20, '5 minutes'))) {
+      // Throttled is still "received" as far as the browser is concerned.
+      // Telemetry that answers with an error invites a retry loop.
+      return res.json({ ok: true, throttled: true });
+    }
+    const batch = Array.isArray(req.body && req.body.errors) ? req.body.errors.slice(0, 10) : [];
+    const ua = String(req.get('user-agent') || '').slice(0, 200);
+    let roomId = null;
+    const code = String((req.body && req.body.roomCode) || '').trim().toUpperCase();
+    if (code) {
+      const room = await findRoom(code);
+      roomId = room ? room.id : null;
+    }
+    for (const item of batch) {
+      recordError({
+        source: 'client',
+        code: item && item.code,
+        where: item && item.where,
+        message: item && item.message,
+        stack: item && item.stack,
+        userAgent: ua,
+        roomId,
+        reqId: req.id,
+      });
+    }
+    res.json({ ok: true, received: batch.length });
+  } catch (err) {
+    // Even the error channel failing is not worth a 500 on the client.
+    log.warn('client_error', { reqId: req.id, msg: err && err.message });
+    res.json({ ok: true });
+  }
+});
+
+app.get('/api/errors', async (req, res) => {
+  try {
+    // Not an error to ask. `/api/metrics` already answers a non-admin with a
+    // 200 that simply withholds the privileged numbers, and these two do the
+    // same: an empty envelope plus `adminOnly`, so the screen can explain
+    // itself instead of the browser logging a failed request on a page that is
+    // working exactly as designed.
+    if (!isAdmin(req.user)) return res.json({ adminOnly: true, grouped: [], recent: [] });
+    const window = latencyLog.rangeSql(req.query.range);
+    const [grouped, recent] = await Promise.all([
+      pool.query(
+        `SELECT source, code, COUNT(*)::int AS n, MAX(created_at) AS last_at
+           FROM error_events WHERE created_at > ${window}
+          GROUP BY source, code ORDER BY COUNT(*) DESC LIMIT 40`
+      ),
+      pool.query(
+        `SELECT e.id, e.source, e.code, e.where_at, e.message, e.stack_head,
+                e.user_agent, e.req_id, e.created_at, r.code AS room_code
+           FROM error_events e LEFT JOIN rooms r ON r.id = e.room_id
+          WHERE e.created_at > ${window}
+          ORDER BY e.created_at DESC LIMIT 10`
+      ),
+    ]);
+    res.json({ grouped: grouped.rows, recent: recent.rows });
+  } catch (err) {
+    fail(res, req, 500, 'internal', err);
+  }
+});
+
+app.get('/api/alerts', async (req, res) => {
+  try {
+    res.json({
+      alerts: await alerts.list(pool, req.query.limit),
+      rules: SLO.RULES,
+      evalIntervalMs: SLO.EVAL_INTERVAL_MS,
+    });
+  } catch (err) {
+    fail(res, req, 500, 'internal', err);
+  }
+});
+
+// Pilot feedback. `compat` carries capability flags and counters only, never
+// caption text: a device report is a description of the browser, not of the
+// conversation that happened in it.
+const COMPAT_KEYS = new Set([
+  'speech', 'mic', 'micPolicy', 'tts', 'voices', 'audioContext',
+  'storage', 'longPoll', 'safeArea', 'platform', 'tier',
+]);
+
+function cleanCompat(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const out = {};
+  for (const key of Object.keys(raw)) {
+    if (!COMPAT_KEYS.has(key)) continue;
+    const v = raw[key];
+    if (typeof v === 'boolean' || typeof v === 'number') out[key] = v;
+    else if (typeof v === 'string') out[key] = v.slice(0, 32);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+app.post('/api/feedback', async (req, res) => {
+  try {
+    if (!(await rateAllows('feedback', `user:${req.user.id}`, 5, '1 hour'))) {
+      return fail(res, req, 429, 'rate_limited');
+    }
+    const body = req.body || {};
+    const rating = parseInt(body.rating, 10);
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+      return fail(res, req, 400, 'bad_request');
+    }
+    const purpose = PURPOSE_KEYS.includes(String(body.purpose)) ? String(body.purpose) : null;
+    const comment = String(body.comment || '').trim().slice(0, 1000) || null;
+    let roomId = null;
+    const code = String(body.roomCode || '').trim().toUpperCase();
+    if (code) {
+      const room = await findRoom(code);
+      roomId = room ? room.id : null;
+    }
+    await pool.query(
+      `INSERT INTO pilot_feedback (user_id, username, room_id, purpose, rating, comment, contact_ok, compat)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)`,
+      [req.user.id, req.user.username || null, roomId, purpose, rating, comment,
+        body.contactOk === true, JSON.stringify(cleanCompat(body.compat))]
+    );
+    log.info('feedback', { reqId: req.id, rating, purpose: purpose || undefined });
+    res.json({ ok: true });
+  } catch (err) {
+    fail(res, req, 500, 'internal', err);
+  }
+});
+
+app.get('/api/feedback', async (req, res) => {
+  try {
+    // Same envelope as `/api/errors` above: withhold the rows, not the answer.
+    if (!isAdmin(req.user)) {
+      return res.json({ adminOnly: true, items: [], byPurpose: [], overall: { n: 0, avg_rating: null } });
+    }
+    const [items, byPurpose, overall] = await Promise.all([
+      pool.query(
+        `SELECT f.id, f.username, f.purpose, f.rating, f.comment, f.contact_ok,
+                f.compat, f.created_at, r.code AS room_code
+           FROM pilot_feedback f LEFT JOIN rooms r ON r.id = f.room_id
+          ORDER BY f.created_at DESC LIMIT 100`
+      ),
+      pool.query(
+        `SELECT COALESCE(purpose, 'unknown') AS purpose, COUNT(*)::int AS n,
+                ROUND(AVG(rating), 2)::float AS avg_rating
+           FROM pilot_feedback GROUP BY 1 ORDER BY 1`
+      ),
+      pool.query(`SELECT COUNT(*)::int AS n, ROUND(AVG(rating), 2)::float AS avg_rating FROM pilot_feedback`),
+    ]);
+    res.json({ items: items.rows, byPurpose: byPurpose.rows, overall: overall.rows[0] });
+  } catch (err) {
+    fail(res, req, 500, 'internal', err);
   }
 });
 
 // --- metrics (Stage 7) -----------------------------------------------------
 app.get('/api/metrics', async (req, res) => {
   try {
-    const [latency, rollups, grants, live, byTier, spend, degraded, endToEnd] = await Promise.all([
+    const range = latencyLog.RANGES[req.query.range] ? String(req.query.range) : latencyLog.DEFAULT_RANGE;
+    const window = latencyLog.rangeSql(range);
+    const admin = isAdmin(req.user);
+    const [latency, rollups, grants, live, byTier, spend, degraded, endToEnd, failures, openAlerts]
+      = await Promise.all([
       pool.query(
         `SELECT
            COUNT(*)::int AS n,
@@ -1404,7 +1833,7 @@ app.get('/api/metrics', async (req, res) => {
            COUNT(*) FILTER (WHERE status = 'unavailable')::int AS unavailable,
            ROUND(AVG(group_size), 1)::float AS avg_group_size
          FROM utterance_translations
-         WHERE created_at > NOW() - INTERVAL '7 days'`
+         WHERE created_at > ${window}`
       ),
       pool.query('SELECT * FROM daily_usage ORDER BY day DESC LIMIT 14'),
       pool.query(
@@ -1427,7 +1856,7 @@ app.get('/api/metrics', async (req, res) => {
                 ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY t.latency_ms))::int AS p95
            FROM utterance_translations t
            JOIN rooms r ON r.id = t.room_id
-          WHERE t.created_at > NOW() - INTERVAL '7 days' AND t.status = 'ok'
+          WHERE t.created_at > ${window} AND t.status = 'ok'
           GROUP BY r.scale_tier
           ORDER BY COUNT(t.*) DESC`
       ),
@@ -1439,33 +1868,70 @@ app.get('/api/metrics', async (req, res) => {
                 COALESCE(SUM(utterances), 0)::int AS utterances,
                 COUNT(*)::int AS sessions
            FROM room_sessions
-          WHERE started_at > NOW() - INTERVAL '7 days'`
+          WHERE started_at > ${window}`
       ),
       pool.query(
         `SELECT degraded_to, COUNT(*)::int AS n
            FROM room_sessions
-          WHERE started_at > NOW() - INTERVAL '7 days' AND degraded_to IS NOT NULL
+          WHERE started_at > ${window} AND degraded_to IS NOT NULL
           GROUP BY degraded_to`
       ),
       // The three legs of the wait, measured separately. `latency` above is
       // the middle one only.
-      latencyLog.endToEnd(pool),
+      latencyLog.endToEnd(pool, range),
+      // Why captions failed. Without this every proxy problem, every declined
+      // grant and every network blip looked like the same grey bar.
+      pool.query(
+        `SELECT COALESCE(fail_code, 'unknown') AS code, status, COUNT(*)::int AS n
+           FROM utterance_translations
+          WHERE created_at > ${window} AND status IN ('error', 'unavailable')
+          GROUP BY 1, 2 ORDER BY COUNT(*) DESC LIMIT 12`
+      ),
+      alerts.list(pool, 12),
     ]);
     const grantMap = Object.fromEntries(grants.rows.map((r) => [r.outcome, r.n]));
     const asked = (grantMap.granted || 0) + (grantMap.declined || 0) + (grantMap.dismissed || 0);
+    const L = latency.rows[0] || {};
+    const failed = Number(L.errors || 0) + Number(L.unavailable || 0);
+    const failRate = Number(L.n) > 0 ? failed / Number(L.n) : null;
+    const readiness = SLO.evaluate({
+      latency: endToEnd.overall,
+      ttftP95: L.ttft_p95,
+      failRate,
+      translationCount: L.n,
+    });
+    const failTotal = failures.rows.reduce((sum, r) => sum + Number(r.n), 0);
     res.json({
-      isAdmin: isAdmin(req.user),
+      isAdmin: admin,
+      range,
+      ranges: Object.keys(latencyLog.RANGES),
       latency: latency.rows[0],
       endToEnd,
       daily: rollups.rows,
-      grants: {
+      grants: !admin ? null : {
         ...grantMap,
         asked,
         acceptanceRate: asked ? Math.round(((grantMap.granted || 0) / asked) * 100) : null,
       },
       live: live.rows[0],
       byTier: byTier.rows,
-      cost: {
+      slo: readiness,
+      failures: {
+        total: failTotal,
+        rate: failRate,
+        rows: failures.rows.map((r) => ({
+          code: r.code,
+          status: r.status,
+          n: Number(r.n),
+          share: failTotal ? Number(r.n) / failTotal : 0,
+        })),
+      },
+      alerts: openAlerts,
+      openAlerts: openAlerts.filter((a) => !a.resolved_at).length,
+      // Spend is an admin number. The labels still render for everybody (the
+      // panel says who can see the value) so the screen does not silently
+      // change shape depending on who is looking at it.
+      cost: !admin ? null : {
         spentCents: spend.rows[0].spent_cents,
         calls: spend.rows[0].calls,
         utterances: spend.rows[0].utterances,
@@ -1477,43 +1943,75 @@ app.get('/api/metrics', async (req, res) => {
           : null,
       },
       degraded: Object.fromEntries(degraded.rows.map((r) => [r.degraded_to, r.n])),
+      grantsVisible: admin,
       engines: translator.engineStatus(),
       engine: translator.activeEngineId(),
       translationSessions: translator.sessionCount(),
-      dialIn: telephony.status(),
+      dialIn: telephony.status(uiLangOf(req)),
       llmEnabled: translator.LLM_ENABLED,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    fail(res, req, 500, 'internal', err);
   }
 });
 
 // --- static + HTML shell ---------------------------------------------------
-app.use(express.static(path.join(__dirname, 'public')));
+// The two app scripts change on every deploy and must never be served stale,
+// but they are also the largest thing a returning listener downloads. An ETag
+// plus `no-cache` is the pair that gets both: the browser always revalidates,
+// and an unchanged file comes back as a 304 with no body. Compression above
+// does the rest.
+app.use(express.static(path.join(__dirname, 'public'), {
+  etag: true,
+  setHeaders(res, filePath) {
+    if (/[\\/](app|audio)\.js$/.test(filePath)) {
+      res.setHeader('Cache-Control', 'no-cache');
+    }
+  },
+}));
 
 // Chromeless deep links: an unauthenticated TOP-LEVEL visit to this app's own
 // subdomain (a share link pasted into a browser) cannot be served, because the
 // iframe token only exists inside the platform shell. Bounce it to the
 // platform's chromeless view WITH the requested path so the visitor lands on
 // the shared room instead of the home screen.
+// Relative-only, single leading slash, no scheme, no host, none of the
+// characters that would break out of the query value, and at most 512
+// characters including that slash: the platform drops anything longer, so an
+// over-long share link must fall back to the app root rather than be sent and
+// silently discarded.
 const SAFE_PATH = /^\/(?!\/)[^\s\\`'"<>]{0,511}$/;
 
 app.get('*', (req, res) => {
   if (!req.user) {
     if (req.get('sec-fetch-dest') === 'document') {
       const inner = req.originalUrl;
+      // Encoded as ONE query value: the inner path may carry its own query,
+      // and its `&` and `=` have to survive the trip through the shell.
       const target = SAFE_PATH.test(inner)
-        ? `${PLATFORM_BASE_URL}/#app/${APP_SLUG}/full?path=${inner}`
+        ? `${PLATFORM_BASE_URL}/#app/${APP_SLUG}/full?path=${encodeURIComponent(inner)}`
         : `${PLATFORM_BASE_URL}/#app/${APP_SLUG}/full`;
       return res.redirect(302, target);
     }
-    return res.status(401).json({ error: 'Not authenticated' });
+    return fail(res, req, 401, 'not_authenticated');
   }
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+// The last word on any error that escaped a route. Four arguments, because
+// that arity is how Express recognises an error handler at all. The client
+// gets a fixed message keyed by code; `err.message` never crosses the wire,
+// so a stack frame or a connection string cannot leak through a 500.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  fail(res, req, 500, 'internal', err);
+});
+
 // --- background jobs -------------------------------------------------------
-async function houseKeeping() {
+// Two cadences. The heavy pruning and the daily rollup are hourly; alert
+// evaluation runs every five minutes because a rule that opens two hours
+// after the room went silent is a report, not an alert.
+async function houseKeepingHourly() {
   try {
     // Captions are transient. Keep the DB (and every staging clone of it)
     // from accumulating call transcripts forever.
@@ -1525,9 +2023,23 @@ async function houseKeeping() {
     // Latency samples are aggregates, not content, but they are also not
     // interesting past the window the metrics screen reads.
     await latencyLog.prune(pool);
+    // Error events are diagnostics with a short shelf life. Two weeks is long
+    // enough to cover a pilot week and the retrospective after it.
+    await pool.query(`DELETE FROM error_events WHERE created_at < NOW() - INTERVAL '14 days'`);
+    // Resolved alerts stop being useful once the incident is written up.
+    await pool.query(
+      `DELETE FROM alerts WHERE resolved_at IS NOT NULL AND resolved_at < NOW() - INTERVAL '30 days'`
+    );
     // In-memory translation sessions nobody has spoken into for ten minutes.
     const dropped = translator.sweepSessions();
-    if (dropped) console.log(`[housekeeping] dropped ${dropped} idle translation sessions`);
+    if (dropped) log.info('housekeeping', { dropped, msg: 'idle translation sessions dropped' });
+    // Per-room fan-out queues for rooms nobody is translating into any more.
+    // These are plain Maps keyed by room id: without a sweep they are a slow
+    // leak for the life of the container.
+    if (translator.sweepQueues) {
+      const swept = translator.sweepQueues();
+      if (swept) log.info('housekeeping', { swept, msg: 'stale fan-out queues dropped' });
+    }
     // Lapsed floor leases. Claiming already reaps, but a room that went quiet
     // should not keep showing a speaker who left an hour ago.
     await pool.query(`DELETE FROM active_speakers WHERE until <= NOW() - INTERVAL '5 minutes'`);
@@ -1570,23 +2082,44 @@ async function houseKeeping() {
          updated_at = NOW()`
     );
   } catch (err) {
-    console.error('[housekeeping]', err.message);
+    log.error('housekeeping', { msg: err.message });
+  }
+}
+
+// Alert evaluation. Deliberately separate from the hourly job and deliberately
+// hysteretic: a rule opens only after two consecutive breaching evaluations
+// and resolves only after two clear ones, so a single slow minute does not
+// raise a page and a single fast minute does not close one.
+async function evaluateAlerts() {
+  if (shuttingDown) return;
+  try {
+    await alerts.evaluate(pool, { latency: latencyLog, slo: SLO });
+  } catch (err) {
+    log.error('alerts', { msg: err && err.message });
   }
 }
 
 // --- boot + graceful shutdown ---------------------------------------------
 let server;
 let houseKeepingTimer;
+let alertTimer;
 
 async function start() {
   await migrate(pool);
   if (IS_STAGING) await seedStaging(pool);
-  await houseKeeping();
-  houseKeepingTimer = setInterval(houseKeeping, 60 * 60 * 1000);
+  await houseKeepingHourly();
+  houseKeepingTimer = setInterval(houseKeepingHourly, 60 * 60 * 1000);
   houseKeepingTimer.unref?.();
+  await evaluateAlerts();
+  alertTimer = setInterval(evaluateAlerts, SLO.EVAL_INTERVAL_MS);
+  alertTimer.unref?.();
 
   server = app.listen(port, () => {
-    console.log(`LIVE TRANSLATION listening on :${port} (env=${process.env.USERNODE_ENV || 'production'}, llm=${translator.LLM_ENABLED})`);
+    log.info('listen', {
+      port, env: process.env.USERNODE_ENV || 'production',
+      llm: translator.LLM_ENABLED, version: APP_VERSION,
+      msg: 'LIVE TRANSLATION ready',
+    });
   });
 }
 
@@ -1595,8 +2128,12 @@ const DRAIN_MS = 3000;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`[shutdown] ${signal} received, draining`);
+  log.info('shutdown', { signal, msg: 'draining' });
+  // Wake every held listener at once. Without this a drain waits out the last
+  // long poll's hold before the socket count reaches zero.
+  stream.stopWatchers();
   if (houseKeepingTimer) clearInterval(houseKeepingTimer);
+  if (alertTimer) clearInterval(alertTimer);
   if (server) {
     server.close(() => {});
     server.closeIdleConnections?.();
@@ -1606,7 +2143,7 @@ async function shutdown(signal) {
   try {
     await pool.end();
   } catch (e) {
-    console.error('[shutdown] pool.end failed', e.message);
+    log.error('shutdown', { detail: 'pool.end failed', msg: e.message });
   }
   process.exit(0);
 }
@@ -1614,4 +2151,4 @@ async function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-start().catch((err) => { console.error(err); process.exit(1); });
+start().catch((err) => { log.error('boot', { msg: err && err.message, stack: String(err && err.stack || '').slice(0, 400) }); process.exit(1); });

@@ -2,14 +2,16 @@
   "name": "live-translation-412ab4",
   "version": "1.0.0",
   "private": true,
-  "description": "LIVE TRANSLATION \u2014 cross-language live voice for UserNode Labs",
+  "description": "LIVE TRANSLATION — cross-language live voice for UserNode Labs",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "loadtest": "node scripts/loadtest.js"
   },
   "dependencies": {
+    "compression": "^1.8.1",
     "express": "^4.21.0",
-    "pg": "^8.13.0",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.13.0"
   }
 }
