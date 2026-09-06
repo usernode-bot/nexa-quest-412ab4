@@ -76,6 +76,16 @@ itself mid-word.
 If your device has no voice for a language, that caption is shown as text and
 says so. Nothing is lost, you just read it.
 
+## The language the app itself speaks
+
+The same sheet has an **Interface language** section: it sets the language of
+the buttons, headings and labels, and nothing else. "Match my device" is the
+default and follows your Usernode language setting, then your device.
+
+The language you hear is a separate choice. Under the three listening modes
+the sheet names it in a sentence, so the two can never be confused: you can
+read the app in English while hearing every caption in Bahasa Indonesia.
+
 ## When something does not work
 
 - **A caption says translation is unavailable.** Either the app has no AI

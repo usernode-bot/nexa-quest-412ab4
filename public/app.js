@@ -72,6 +72,21 @@
     ));
   }
 
+  // The same lookup, but pinned to a language the caller names instead of the
+  // interface one. Used for text that is SPOKEN rather than read: the words
+  // have to match the voice tag they are handed to, and that voice belongs to
+  // the listening language, not to whatever the buttons are written in.
+  function tFor(lang, key, vars) {
+    const tables = (S.config && S.config.strings) || {};
+    const table = tables[lang] || tables.en || {};
+    const en = tables.en || {};
+    const raw = table[key] != null ? table[key] : (en[key] != null ? en[key] : key);
+    if (!vars) return raw;
+    return String(raw).replace(/\{(\w+)\}/g, (m, k) => (
+      Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m
+    ));
+  }
+
   // Map any BCP-47 tag onto a table we ship, or null for "no preference".
   function resolveUiLang(tag) {
     if (!tag) return null;
@@ -80,6 +95,28 @@
     if (tables[v]) return v;
     const prefix = v.split('-')[0];
     return tables[prefix] ? prefix : null;
+  }
+
+  // What the interface language would be with no in-app choice: the platform
+  // setting, then the device, then English. Synchronous, because the platform
+  // answer is cached on S — the picker needs to label its "Match my device" row
+  // without awaiting anything. A null platform locale means "no preference
+  // recorded", not "English", which is why it falls through to the device.
+  function resolveAutoUiLang() {
+    return resolveUiLang(S.platformLocale)
+      || resolveUiLang(navigator.language)
+      || (S.config && S.config.defaultUiLang)
+      || 'en';
+  }
+
+  // The full chain, applied. `?lang=` is a display-only override for one page
+  // view: it writes nothing and survives no reload, which is what makes it safe
+  // to point a screenshot at.
+  function applyUiLang() {
+    const forced = resolveUiLang(new URLSearchParams(location.search).get('lang'));
+    S.uiLang = forced || resolveUiLang(S.prefs && S.prefs.uiLang) || resolveAutoUiLang();
+    document.documentElement.setAttribute('lang', S.uiLang);
+    return S.uiLang;
   }
 
   // --- client error reporting ----------------------------------------------
@@ -120,8 +157,13 @@
     // The interface language. Resolved in boot(); `?lang=` overrides it for
     // one page view and writes nothing.
     uiLang: 'en',
+    // The platform-level locale, asked for ONCE in boot() and cached here so
+    // the interface language can be re-resolved synchronously every time the
+    // picker moves. null means "not asked yet or no preference recorded", which
+    // is not the same as English.
+    platformLocale: null,
     metricsRange: '7d',
-    prefs: { speaksLang: 'en', hearsLang: 'en', audioMode: 'both', ttsEnabled: true, isDefault: true },
+    prefs: { speaksLang: 'en', hearsLang: 'en', audioMode: 'both', ttsEnabled: true, uiLang: null, isDefault: true },
     route: null,
     room: null,
     me: null,
@@ -266,6 +308,42 @@
   // Rendered as our own DOM (not a kit sheet) so `#lang-sheet` is a stable
   // test anchor and the `?screen=languages` deep link renders identically in
   // production, where the "before" screenshot is taken.
+  // Step 1 of the interface-language chain has always been writable through
+  // the API and documented in the troubleshooting guide, but nothing in the UI
+  // could reach it. This section is that missing control. "Match my device" is
+  // the null row: it clears the stored choice and hands the decision back to
+  // the platform locale, then the device.
+  function uiLangSectionHTML() {
+    const codes = (S.config && S.config.uiLangs) || ['en'];
+    const langs = (S.config && S.config.languages) || [];
+    const stored = S.prefs && S.prefs.uiLang ? String(S.prefs.uiLang) : '';
+    const row = (code, label, sub, on) => `
+      <button data-ui-lang-pick data-code="${esc(code)}" aria-pressed="${on ? 'true' : 'false'}"
+              class="un-pressable w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left ${on ? 'bg-violet-600/20 ring-1 ring-violet-500' : 'bg-zinc-900'}">
+        <span class="flex-1 min-w-0">
+          <span class="block text-sm">${esc(label)}</span>
+          ${sub ? `<span class="block text-xs text-zinc-500">${esc(sub)}</span>` : ''}
+        </span>
+        ${on ? '<span class="text-violet-400 text-sm">✓</span>' : ''}
+      </button>`;
+    // Endonyms, exactly as in the speak / hear lists: a language's own name is
+    // the one label a person can recognise without already reading the
+    // interface language.
+    const rows = codes.map((code) => {
+      const l = langs.find((x) => x.code === code);
+      const label = l ? `${l.flag} ${l.label}` : code;
+      return row(code, label, l ? l.english : '', stored === code);
+    });
+    return `
+      <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">${esc(t('sheet.uiLang'))}</h3>
+      <div id="ui-lang-picker" data-ui-lang="${esc(stored)}" class="grid gap-1.5 mb-2">
+        ${row('', t('sheet.uiLangAuto'), langOf(resolveAutoUiLang() || 'en').label, !stored)}
+        ${rows.join('')}
+      </div>
+      <p class="text-xs text-zinc-600 mb-5">${esc(t('sheet.uiLangBlurb'))}</p>
+    `;
+  }
+
   function renderLanguageSheet() {
     const overlay = document.getElementById('overlay');
     const langs = (S.config && S.config.languages) || [];
@@ -284,51 +362,51 @@
 
     overlay.innerHTML = `
       <div class="fixed inset-0 z-40 bg-black/60" data-close-sheet></div>
-      <section id="lang-sheet" role="dialog" aria-label="Language settings"
+      <section id="lang-sheet" role="dialog" aria-label="${esc(t('sheet.aria'))}"
                class="fixed inset-x-0 bottom-0 z-50 max-h-[88vh] overflow-y-auto rounded-t-2xl bg-zinc-950 border-t border-zinc-800 fade-in"
                style="padding-bottom: calc(1.25rem + var(--un-safe-inset-bottom, env(safe-area-inset-bottom, 0px)))">
         <div class="max-w-2xl mx-auto px-4 pt-3">
           <div class="mx-auto mb-3 h-1 w-10 rounded-full bg-zinc-700"></div>
-          <h2 class="text-base font-semibold">Your languages</h2>
-          <p class="text-xs text-zinc-500 mt-0.5 mb-4">
-            You speak one language and hear another. Everyone in the call picks their own pair.
-          </p>
+          <h2 class="text-base font-semibold">${esc(t('sheet.title'))}</h2>
+          <p class="text-xs text-zinc-500 mt-0.5 mb-4">${esc(t('sheet.blurb'))}</p>
 
-          <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">I speak</h3>
+          <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">${esc(t('sheet.iSpeak'))}</h3>
           <div class="grid gap-1.5 mb-5">
             ${langs.map((l) => option(l, 'speaksLang', S.prefs.speaksLang === l.code)).join('')}
           </div>
 
-          <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">I want to hear / read</h3>
+          <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">${esc(t('sheet.iHear'))}</h3>
           <div class="grid gap-1.5 mb-5">
             ${langs.map((l) => option(l, 'hearsLang', S.prefs.hearsLang === l.code)).join('')}
           </div>
 
-          <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">What I hear</h3>
-          <div id="audio-mode-sheet" data-mode="${esc(audioMode())}" class="grid gap-1.5 mb-5">
+          <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">${esc(t('audio.youHear'))}</h3>
+          <div id="audio-mode-sheet" data-mode="${esc(audioMode())}" class="grid gap-1.5 mb-2">
             ${(((S.config && S.config.audio) || {}).MODES || ['translation', 'original', 'both']).map((m) => {
-              const c = AUDIO_MODE_COPY[m] || { icon: '🔈', label: m, hint: '' };
               const on = m === audioMode();
               return `
                 <button data-audio-mode-pick="${esc(m)}" aria-pressed="${on ? 'true' : 'false'}"
                         class="un-pressable w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left ${on ? 'bg-violet-600/20 ring-1 ring-violet-500' : 'bg-zinc-900'}">
-                  <span class="text-lg">${c.icon}</span>
+                  <span class="text-lg">${AUDIO_MODE_ICONS[m] || '🔈'}</span>
                   <span class="flex-1 min-w-0">
-                    <span class="block text-sm truncate">${esc(c.label)}</span>
-                    <span class="block text-xs text-zinc-500 truncate">${esc(c.hint)}</span>
+                    <span class="block text-sm">${esc(audioModeLabel(m))}</span>
+                    <span class="block text-xs text-zinc-500">${esc(audioModeHint(m))}</span>
                   </span>
                   ${on ? '<span class="text-violet-400 text-sm">✓</span>' : ''}
                 </button>`;
             }).join('')}
           </div>
+          <p class="text-xs text-zinc-600 mb-5">${esc(t('audio.hearingIn', { lang: langOf(S.prefs.hearsLang).label }))}</p>
+
+          ${uiLangSectionHTML()}
 
           ${soon.length ? `
-            <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">Coming soon</h3>
+            <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">${esc(t('sheet.comingSoon'))}</h3>
             <div class="flex flex-wrap gap-1.5 mb-5">
               ${soon.map((l) => `<span class="px-2 py-1 rounded-full bg-zinc-900 text-zinc-500 text-xs">${l.flag} ${esc(l.label)}</span>`).join('')}
             </div>` : ''}
 
-          <button id="lang-save" class="un-pressable w-full py-3 rounded-xl bg-violet-600 text-white font-medium">Save languages</button>
+          <button id="lang-save" class="un-pressable w-full py-3 rounded-xl bg-violet-600 text-white font-medium">${esc(t('sheet.save'))}</button>
         </div>
       </section>`;
 
@@ -346,6 +424,15 @@
       render();
     };
     overlay.querySelector('[data-close-sheet]').addEventListener('click', closeSheet);
+    overlay.querySelectorAll('[data-ui-lang-pick]').forEach((b) => {
+      b.addEventListener('click', () => {
+        // Applied immediately so the sheet you are looking at re-renders in the
+        // language you just picked; Save is what makes it survive a reload.
+        S.prefs.uiLang = b.dataset.code || null;
+        applyUiLang();
+        renderLanguageSheet();
+      });
+    });
     overlay.querySelectorAll('[data-audio-mode-pick]').forEach((b) => {
       b.addEventListener('click', () => {
         // Applied to the bus straight away so the change is audible before the
@@ -359,9 +446,15 @@
     });
     overlay.querySelector('#lang-save').addEventListener('click', async () => {
       const hadHears = S.hearsLang;
+      const lastGood = Object.assign({}, S.prefs);
       try {
-        const r = await api('/api/me/prefs', { method: 'PUT', body: S.prefs });
+        // uiLang is sent explicitly, including as null: the server preserves a
+        // stored value for any key the body omits, so "Match my device" has to
+        // say null out loud or it can never be cleared.
+        const body = Object.assign({}, S.prefs, { uiLang: S.prefs.uiLang || null });
+        const r = await api('/api/me/prefs', { method: 'PUT', body });
         S.prefs = r.prefs;
+        applyUiLang();
         if (S.route && S.route.name === 'room' && S.isMember) {
           const patched = await api(`/api/rooms/${S.route.code}/me`, {
             method: 'PATCH',
@@ -382,13 +475,17 @@
             if (Audio) Audio.reset();
             S.backfilling = patched.backfilling || 0;
             if (S.backfilling) {
-              notify(`Bahasa diganti. ${S.backfilling} kalimat terakhir sedang diterjemahkan ulang.`);
+              notify(t('room.langSwitched', { n: S.backfilling }));
             }
           }
           S.cursor = 0;
         }
-        notify('Languages saved');
+        notify(t('sheet.saved'));
       } catch (err) {
+        // The picker already repainted the interface. A failed save has to put
+        // that back, or the app is speaking a language the server never stored.
+        S.prefs = lastGood;
+        applyUiLang();
         notify(err.message);
       }
       closeSheet();
@@ -857,11 +954,13 @@
     }
   }
 
-  const AUDIO_MODE_COPY = {
-    translation: { icon: '🔊', label: 'Terjemahan', hint: 'Hanya suara terjemahan.' },
-    original: { icon: '📝', label: 'Asli', hint: 'Teks saja, tidak ada suara.' },
-    both: { icon: '🎧', label: 'Keduanya', hint: 'Ruangan pelan di bawah terjemahan.' },
-  };
+  // Only the glyphs live here now. An icon is the same in every language; the
+  // label and the sentence under it come from the string table, so this
+  // constant can no longer pin the section to one language the way it did.
+  const AUDIO_MODE_ICONS = { translation: '🔊', original: '📝', both: '🎧' };
+
+  const audioModeLabel = (m) => t(`audio.mode.${m}`);
+  const audioModeHint = (m) => t(`audio.${m}`);
 
   // The three-mode selector. Rendered for members AND for someone reading the
   // room without having joined: choosing whether to be read to is a listener's
@@ -872,50 +971,49 @@
     const st = Audio ? Audio.state() : null;
     let note = '';
     if (st && !st.supported) {
-      note = 'Peramban ini tidak bisa membacakan teks, jadi terjemahan tampil sebagai teks saja.';
+      note = t('audio.noTts');
     } else if (st && st.disabled) {
-      note = 'Suara dimatikan sementara karena beberapa kalimat gagal dibacakan. Teksnya tetap lengkap.';
-    } else if (cur === 'both') {
-      note = 'Anda mendengar ruangan pelan di bawah suara terjemahan.';
-    } else if (cur === 'original') {
-      note = 'Tidak ada suara terjemahan. Semua tetap tampil sebagai teks.';
+      note = t('audio.paused');
     } else {
-      note = 'Anda hanya mendengar suara terjemahan.';
+      note = audioModeHint(cur);
     }
     return `
       <div id="${esc(id)}" data-mode="${esc(cur)}" class="p-3 rounded-xl bg-zinc-900 space-y-2">
         <div class="flex items-center gap-2">
-          <span class="text-xs uppercase tracking-wide text-zinc-500">Yang Anda dengar</span>
+          <span class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('audio.youHear'))}</span>
           <span class="flex-1"></span>
-          ${st && st.speaking ? '<span class="text-[11px] text-emerald-400">membacakan…</span>' : ''}
+          ${st && st.speaking ? `<span class="text-[11px] text-emerald-400">${esc(t('audio.speaking'))}</span>` : ''}
         </div>
         <div class="grid grid-cols-3 gap-1.5">
           ${modes.map((m) => {
-            const c = AUDIO_MODE_COPY[m] || { icon: '🔈', label: m, hint: '' };
             const on = m === cur;
             return `
               <button data-audio-mode="${esc(m)}" aria-pressed="${on ? 'true' : 'false'}"
                       class="un-pressable flex flex-col items-center gap-0.5 py-2 rounded-lg text-xs ${on ? 'bg-violet-600/20 ring-1 ring-violet-500 text-violet-200' : 'bg-zinc-800 text-zinc-400'}">
-                <span class="text-base">${c.icon}</span>
-                <span>${esc(c.label)}</span>
+                <span class="text-base">${AUDIO_MODE_ICONS[m] || '🔈'}</span>
+                <span>${esc(audioModeLabel(m))}</span>
               </button>`;
           }).join('')}
         </div>
         <p class="text-[11px] text-zinc-600">${esc(note)}</p>
+        <p class="text-[11px] text-zinc-600">${esc(t('audio.hearingIn', { lang: langOf(S.hearsLang).label }))}</p>
       </div>`;
   }
 
+  // Field names, not prose: this line is read by whoever is debugging the bus,
+  // and ASCII keys stay the same in every interface language rather than
+  // needing a translation nobody would trust.
   function audioDemoLine(st) {
-    if (!st) return 'Audio bus belum siap.';
+    if (!st) return t('audio.busNotReady');
     return [
       `mode ${st.mode}`,
-      `suara ${st.voices}`,
-      `antre ${st.queuedSegments}/${st.queuedUtterances}`,
-      st.speaking ? 'membacakan' : 'diam',
-      st.ducked ? 'diredam' : 'normal',
-      `sink ${st.sinks}`,
-      `teks ${st.fallbacks}`,
-      `laju ${st.rate}`,
+      `voices ${st.voices}`,
+      `queued ${st.queuedSegments}/${st.queuedUtterances}`,
+      `speaking ${st.speaking ? 'yes' : 'no'}`,
+      `ducked ${st.ducked ? 'yes' : 'no'}`,
+      `sinks ${st.sinks}`,
+      `text ${st.fallbacks}`,
+      `rate ${st.rate}`,
     ].join(' · ');
   }
 
@@ -929,18 +1027,15 @@
     const st = Audio ? Audio.state() : null;
     return `
       <section id="audio-demo" class="p-3 rounded-xl bg-zinc-900 ring-1 ring-violet-600/30 space-y-2">
-        <h3 class="text-xs uppercase tracking-wide text-violet-300">Audio bus</h3>
-        <p class="text-[11px] text-zinc-500">
-          Panel diagnostik. Menunjukkan apa yang sedang dibacakan, berapa klausa yang mengantre,
-          dan apakah suara ruangan sedang diredam.
-        </p>
+        <h3 class="text-xs uppercase tracking-wide text-violet-300">${esc(t('audio.busTitle'))}</h3>
+        <p class="text-[11px] text-zinc-500">${esc(t('audio.busBlurb'))}</p>
         <p id="audio-demo-state" class="text-[11px] font-mono text-zinc-400 break-words">${esc(audioDemoLine(st))}</p>
         <div class="flex gap-2">
-          <button id="audio-demo-say" class="un-pressable flex-1 py-2 rounded-lg bg-zinc-800 text-xs">Coba satu kalimat</button>
-          <button id="audio-demo-stop" class="un-pressable flex-1 py-2 rounded-lg bg-zinc-800 text-xs">Hentikan suara</button>
+          <button id="audio-demo-say" class="un-pressable flex-1 py-2 rounded-lg bg-zinc-800 text-xs">${esc(t('audio.trySentence'))}</button>
+          <button id="audio-demo-stop" class="un-pressable flex-1 py-2 rounded-lg bg-zinc-800 text-xs">${esc(t('audio.stopVoice'))}</button>
         </div>
         ${st && !st.supported
-          ? '<p class="text-[11px] text-amber-400/80">Perangkat ini tidak punya penyintesis suara, jadi semuanya tetap tampil sebagai teks.</p>'
+          ? `<p class="text-[11px] text-amber-400/80">${esc(t('audio.noSynth'))}</p>`
           : ''}
       </section>`;
   }
@@ -1005,7 +1100,7 @@
     } else if (tr && tr.status === 'ok') {
       translationBlock = `<p class="translation text-sm text-zinc-100">${esc(tr.text)}</p>
         ${audioFellBack(u, tr)
-          ? '<p class="audio-fallback text-[11px] text-amber-400/80 mt-1">Tidak bisa dibacakan di perangkat ini. Teksnya lengkap di atas.</p>'
+          ? `<p class="audio-fallback text-[11px] text-amber-400/80 mt-1">${esc(t('audio.cannotSpeak'))}</p>`
           : ''}
         ${tr.latencyMs != null ? `<p class="text-[11px] text-zinc-700 mt-1">${tr.latencyMs} ms</p>` : ''}`;
     } else if (tr && tr.status === 'partial') {
@@ -1164,7 +1259,7 @@
     if (!S.isMember) {
       return `
         <div class="p-3 rounded-xl bg-zinc-900 space-y-2">
-          <p class="text-sm font-medium">Translation preview</p>
+          <p class="text-sm font-medium">${esc(t('room.preview'))}</p>
           <p class="text-xs text-zinc-500">
             You are reading this call in ${esc(langOf(S.hearsLang).label)} without having joined it.
             Join to speak, to raise your hand, and to have your own words translated for everyone else.
@@ -1205,25 +1300,21 @@
       // front and hand over a typing box, rather than showing a mic button
       // that only explains itself after it has failed.
       const queueLineTyped = tier.handQueue && S.myQueuePosition
-        ? `<p id="queue-status" class="text-xs text-amber-300 px-1">✋ Nomor ${S.myQueuePosition} dalam antrean.</p>`
+        ? `<p id="queue-status" class="text-xs text-amber-300 px-1">✋ ${esc(t('room.queuedShort', { n: S.myQueuePosition }))}</p>`
         : '';
       return `
         <div class="space-y-2">
           ${queueLineTyped}
-          <div id="stt-unsupported" class="p-2.5 rounded-lg bg-zinc-900 text-xs text-zinc-400">
-            Peramban ini tidak punya pengenalan suara, jadi mikrofon dimatikan.
-            Ketik kalimat Anda dan semuanya berjalan seperti biasa: teks asli terkirim,
-            terjemahan tetap dibuat, dan peserta lain tetap mendengarnya dibacakan.
-          </div>
+          <div id="stt-unsupported" class="p-2.5 rounded-lg bg-zinc-900 text-xs text-zinc-400">${esc(t('room.noStt'))}</div>
           <p id="mic-error" class="hidden text-xs text-amber-400"></p>
           <form id="type-form" class="flex gap-2">
             <input id="type-input" maxlength="${(S.config && S.config.limits.MAX_UTTERANCE_CHARS) || 500}"
-                   placeholder="Ketik dalam ${esc(langOf(S.prefs.speaksLang).label)}"
+                   placeholder="${esc(t('room.typePlaceholder', { lang: langOf(S.prefs.speaksLang).label }))}"
                    class="flex-1 px-3 py-2.5 rounded-xl bg-zinc-900 text-sm placeholder-zinc-600 outline-none focus:ring-1 focus:ring-violet-500">
-            <button class="un-pressable px-4 rounded-xl bg-violet-600 text-white text-sm font-medium">Kirim</button>
+            <button class="un-pressable px-4 rounded-xl bg-violet-600 text-white text-sm font-medium">${esc(t('common.send'))}</button>
           </form>
           <button id="tts-quick" class="un-pressable w-full py-2 rounded-xl bg-zinc-800 text-sm">
-            ${S.prefs.ttsEnabled ? '🔊 Terjemahan dibacakan' : '🔇 Terjemahan tidak dibacakan'}
+            ${S.prefs.ttsEnabled ? `🔊 ${esc(t('room.ttsOn'))}` : `🔇 ${esc(t('room.ttsOff'))}`}
           </button>
         </div>`;
     }
@@ -1233,7 +1324,7 @@
     // position. The server puts your hand up for you when it refuses, so this
     // line is a database fact rather than a guess.
     const queueLine = tier.handQueue && S.myQueuePosition
-      ? `<p id="queue-status" class="text-xs text-amber-300 px-1">✋ You are number ${S.myQueuePosition} in the queue. You will be able to speak when a slot opens.</p>`
+      ? `<p id="queue-status" class="text-xs text-amber-300 px-1">✋ ${esc(t('room.queued', { n: S.myQueuePosition }))}</p>`
       : '';
     return `
       <div class="space-y-2">
@@ -1245,17 +1336,17 @@
         </div>
         <div class="flex gap-2">
           <button id="mic-toggle" class="un-pressable flex-1 py-3 rounded-xl font-medium text-sm ${listening ? 'bg-red-600 text-white' : 'bg-violet-600 text-white'}">
-            ${listening ? '■ Stop speaking' : '🎙 Start speaking'}
+            ${listening ? `■ ${esc(t('room.stopSpeaking'))}` : `🎙 ${esc(t('room.startSpeaking'))}`}
           </button>
-          <button id="tts-quick" class="un-pressable px-4 rounded-xl bg-zinc-800 text-sm" title="Play translations out loud">
+          <button id="tts-quick" class="un-pressable px-4 rounded-xl bg-zinc-800 text-sm" title="${esc(t('room.ttsQuickTitle'))}">
             ${S.prefs.ttsEnabled ? '🔊' : '🔇'}
           </button>
         </div>
         <form id="type-form" class="flex gap-2">
           <input id="type-input" maxlength="${(S.config && S.config.limits.MAX_UTTERANCE_CHARS) || 500}"
-                 placeholder="…or type it in ${esc(langOf(S.prefs.speaksLang).label)}"
+                 placeholder="${esc(t('room.orTypePlaceholder', { lang: langOf(S.prefs.speaksLang).label }))}"
                  class="flex-1 px-3 py-2.5 rounded-xl bg-zinc-900 text-sm placeholder-zinc-600 outline-none focus:ring-1 focus:ring-violet-500">
-          <button class="un-pressable px-4 rounded-xl bg-zinc-800 text-sm">Send</button>
+          <button class="un-pressable px-4 rounded-xl bg-zinc-800 text-sm">${esc(t('common.send'))}</button>
         </form>
       </div>`;
   }
@@ -1268,9 +1359,9 @@
     const sorted = recent.map((r) => r.deliverMs).sort((a, b) => a - b);
     const med = sorted[Math.floor(sorted.length / 2)];
     const worst = sorted[sorted.length - 1];
-    return `<p id="host-latency" class="text-[11px] text-zinc-700 px-1">
-      Pengiriman teks: ${med} ms tengah, ${worst} ms terburuk, dari ${sorted.length} kalimat terakhir.
-    </p>`;
+    return `<p id="host-latency" class="text-[11px] text-zinc-700 px-1">${
+      esc(t('room.hostLatency', { med, worst, n: sorted.length }))
+    }</p>`;
   }
 
   // Naming the number is the whole point. "Reconnecting" alone leaves you
@@ -1279,8 +1370,8 @@
     const queued = S.route && S.route.code
       ? outbox.read().filter((i) => i.code === S.route.code).length
       : 0;
-    if (!queued) return 'Sambungan putus. Kami mencoba menyambung lagi, dan apa pun yang Anda ucapkan akan diantre.';
-    return `Sambungan putus. ${queued} kalimat menunggu di antrean dan akan terkirim begitu sambungan pulih.`;
+    if (!queued) return t('room.disconnected');
+    return t('room.disconnectedQueued', { n: queued });
   }
 
   // Shown to the host only, and as a rung plus a percentage — never a dollar
@@ -1455,11 +1546,17 @@
         if (!bus) return;
         // Offered through the bus rather than spoken directly, so the panel
         // exercises the real path: sealed clauses, queue caps and ducking.
+        // The sample text only exists in the languages we ship a table for.
+        const demoLang = resolveUiLang(S.hearsLang) || 'en';
         bus.offer({
           utteranceId: -1,
           targetLang: S.hearsLang,
-          ttsTag: langOf(S.hearsLang).tts,
-          segments: ['Ini contoh suara terjemahan. ', 'Klausa kedua dibacakan setelahnya.'],
+          ttsTag: demoLang === S.hearsLang ? langOf(S.hearsLang).tts : 'en-US',
+          // Spoken, not read: resolved against the LISTENING language so the
+          // words match the voice tag on the line above. A hears language with
+          // no string table of its own falls back to English text, which is
+          // why the tag falls back with it.
+          segments: [tFor(demoLang, 'audio.sample1'), tFor(demoLang, 'audio.sample2')],
           sealedIdx: 2,
           final: true,
           ageMs: 0,
@@ -2787,37 +2884,26 @@
     // before anything can render a mode selector against it.
     ensureAudio();
 
-    // Which language the INTERFACE speaks, resolved once, in this order:
-    // what this person chose inside the app, then their platform-level
-    // setting, then the device, then English. A null platform locale means
-    // "no preference recorded", not "English", which is exactly why it falls
-    // through to the device instead of stopping there.
-    let uiLang = resolveUiLang(S.prefs && S.prefs.uiLang);
-    if (!uiLang && window.usernode && typeof window.usernode.getUserLocale === 'function') {
+    // The platform locale is asked for exactly once and cached. Two things
+    // want it — which language the INTERFACE speaks, and which language a
+    // first-time visitor is assumed to speak and hear — and asking twice made
+    // one boot wait on two round trips for the same answer.
+    if (window.usernode && typeof window.usernode.getUserLocale === 'function') {
       try {
         const { locale } = await window.usernode.getUserLocale();
-        uiLang = resolveUiLang(locale);
-      } catch { /* standalone: fall through to the device */ }
+        S.platformLocale = locale || null;
+      } catch { /* standalone: stays null, and the device decides */ }
     }
-    if (!uiLang) uiLang = resolveUiLang(navigator.language);
-    // `?lang=` is pure client state. It writes nothing and survives no
-    // reload, which is what makes it safe to point a screenshot at.
-    const forced = resolveUiLang(new URLSearchParams(location.search).get('lang'));
-    S.uiLang = forced || uiLang || (S.config && S.config.defaultUiLang) || 'en';
-    document.documentElement.setAttribute('lang', S.uiLang);
+    applyUiLang();
 
-    // Ask the platform for the user's language preference only when they
-    // have not made a choice inside this app. Their in-app choice wins.
-    if (S.prefs.isDefault && window.usernode && typeof window.usernode.getUserLocale === 'function') {
-      try {
-        const { locale } = await window.usernode.getUserLocale();
-        if (locale) {
-          const match = (S.config.languages || []).find(
-            (l) => locale === l.code || locale.toLowerCase().startsWith(`${l.code}-`)
-          );
-          if (match) { S.prefs.speaksLang = match.code; S.prefs.hearsLang = match.code; S.hearsLang = match.code; }
-        }
-      } catch { /* no shell — keep the JWT-claim default the server gave us */ }
+    // The speak / hear pair follows the platform locale only when this person
+    // has made no choice inside the app. Their in-app choice always wins.
+    if (S.prefs.isDefault && S.platformLocale) {
+      const locale = S.platformLocale;
+      const match = (S.config.languages || []).find(
+        (l) => locale === l.code || locale.toLowerCase().startsWith(`${l.code}-`)
+      );
+      if (match) { S.prefs.speaksLang = match.code; S.prefs.hearsLang = match.code; S.hearsLang = match.code; }
     }
 
     // Consent for AI translation is platform-owned; an app cannot approve
