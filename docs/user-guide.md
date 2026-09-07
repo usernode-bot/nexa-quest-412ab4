@@ -21,13 +21,41 @@ Enter the code on the lobby screen, pick your two languages, and join. You can
 change either language mid-call from the language sheet; captions from that
 point on follow the new choice.
 
-## Not sure yet? Try the demo
+## Not sure yet? Watch a demo call
 
-There is a **Try the demo** button on the lobby. It replays a scripted
-Indonesian and English conversation through the real caption and audio path,
-with no room, no microphone and no cost. It is the fastest way to see what the
-product does, and the fastest way to find out whether your device can speak
-captions out loud.
+There is a **Watch a demo call** button on the lobby. It replays a scripted
+conversation through the real call screen: the same captions, the same roster,
+the same audio path, with no room, no microphone and no cost. It is the fastest
+way to see what the product does, and the fastest way to find out whether your
+device can speak captions out loud.
+
+Two scripts ship with it:
+
+- **Node setup, Jakarta to Manchester** is the default. Two people, Indonesian
+  and English, walking through node setup. It is a direct call, so you see both
+  sides of a two-way conversation.
+- **Mainnet 2.1 townhall** is a 200-person room where one host speaks
+  Indonesian, a listener asks a question in Japanese, and the roster is grouped
+  by language rather than by person. It shows what a large room costs: per
+  language, not per listener.
+
+Switch script from the buttons above the feed. You can also change the language
+you are watching in at any time, without joining anything and without changing
+your saved language pair. Play, pause, start again and skip to the end are
+there too.
+
+When the script ends, **Try it with your own voice** opens a real practice call
+of your own: a direct call with you in it, your microphone, your languages. If
+the language you speak and the language you hear are the same, the app says so,
+because a call where those match has nothing to translate.
+
+The demo is also linkable, which is useful for support and for bug reports:
+
+- `/demo` plays the onboarding script from the start.
+- `/demo?script=townhall` plays the townhall one.
+- `/demo?hears=ja` watches in Japanese (any launched language code works).
+- `/demo?play=0` skips the replay and shows the finished call, which is what
+  you want when you are linking someone to a still screen.
 
 ## Speaking
 

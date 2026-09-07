@@ -182,7 +182,24 @@
     compat: null,
     // The scripted demo call. Client-side only: no API calls, no rows, no
     // spend, and available in every environment because it is not data.
-    demo: { timers: [], seq: 0, running: false },
+    // `active` is the single flag the shared room rendering reads, so there
+    // is one answer to "is this a real call?" rather than one per helper.
+    demo: {
+      active: false,
+      script: null,   // the DEMO_SCRIPTS entry being replayed
+      hears: null,    // the language the viewer is watching in
+      play: true,     // false for ?play=0: paint the settled end state, no timers
+      state: null,    // 'partial' | 'pending' | 'unavailable', for deep links
+      paused: false,
+      finished: false,
+      frames: [],     // the whole replay, precomputed: [{ at, upto, streaming }]
+      showAt: [],     // when each turn first appeared, so caption ages hold still
+      startedAt: 0,
+      playingSince: 0,
+      pausedAt: 0,
+      timers: [],
+      seq: 0,
+    },
   };
 
   // The room's tier, with a shape that is safe to read before the first poll
@@ -307,7 +324,7 @@
           <h3 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">What I hear</h3>
           <div id="audio-mode-sheet" data-mode="${esc(audioMode())}" class="grid gap-1.5 mb-5">
             ${(((S.config && S.config.audio) || {}).MODES || ['translation', 'original', 'both']).map((m) => {
-              const c = AUDIO_MODE_COPY[m] || { icon: '🔈', label: m, hint: '' };
+              const c = audioModeCopy(m);
               const on = m === audioMode();
               return `
                 <button data-audio-mode-pick="${esc(m)}" aria-pressed="${on ? 'true' : 'false'}"
@@ -504,7 +521,9 @@
       const el = $('#open-rooms');
       if (!rooms.length) {
         el.innerHTML = `<h2 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">Open calls</h2>
-          <p class="text-sm text-zinc-600">No calls running. Start one above.</p>`;
+          <p class="text-sm text-zinc-600">${esc(t('lobby.orDemo'))}</p>
+          <p class="mt-2"><a href="/demo" data-nav="/demo" class="text-sm text-violet-400 underline decoration-violet-900">${esc(t('lobby.demo'))}</a></p>`;
+        bindNav(el);
         return;
       }
       el.innerHTML = `<h2 class="text-xs uppercase tracking-wide text-zinc-500 mb-2">Open calls</h2>
@@ -763,7 +782,8 @@
     audioRenderQueued = true;
     setTimeout(() => {
       audioRenderQueued = false;
-      if (S.route && S.route.name === 'room' && S.room) renderRoom();
+      // The demo renders the same screen, so it wants the same refresh.
+      if (S.route && (S.route.name === 'room' || S.route.name === 'demo') && S.room) renderRoom();
     }, 80);
   }
 
@@ -782,7 +802,14 @@
   function offerAudio(u, tr, final) {
     if (!tr || !Audio || !S.room || S.room.endedAt) return;
     if (S.suppressTts) return;
-    if (S.me && u && u.speakerUserId === S.me.userId) return;
+    // Normally your own words are not read back at you: everyone else in the
+    // room is hearing them, and a second voice over your own is noise. Alone
+    // in a room there is nobody else to hear it, and hearing your own sentence
+    // come back in another language IS the product, so let it through. Echo is
+    // already handled: the microphone is a duck sink with a floor of zero, so
+    // the recogniser is off for exactly as long as the voice is speaking.
+    const solo = S.participantCount <= 1;
+    if (!solo && S.me && u && u.speakerUserId === S.me.userId) return;
     if (u && !S.room.twoWay) {
       const speaker = S.participants.get(u.speakerUserId);
       if (speaker && speaker.role === 'audience') return;
@@ -857,11 +884,16 @@
     }
   }
 
-  const AUDIO_MODE_COPY = {
-    translation: { icon: '🔊', label: 'Terjemahan', hint: 'Hanya suara terjemahan.' },
-    original: { icon: '📝', label: 'Asli', hint: 'Teks saja, tidak ada suara.' },
-    both: { icon: '🎧', label: 'Keduanya', hint: 'Ruangan pelan di bawah terjemahan.' },
-  };
+  const AUDIO_MODE_ICON = { translation: '🔊', original: '📝', both: '🎧' };
+
+  // Resolved per call rather than frozen into a constant: the label has to
+  // follow the UI language, and the UI language can change without a reload.
+  function audioModeCopy(mode) {
+    const icon = AUDIO_MODE_ICON[mode];
+    if (!icon) return { icon: '🔈', label: mode, hint: '' };
+    const key = mode.charAt(0).toUpperCase() + mode.slice(1);
+    return { icon, label: t('audio.mode' + key), hint: t('audio.hint' + key) };
+  }
 
   // The three-mode selector. Rendered for members AND for someone reading the
   // room without having joined: choosing whether to be read to is a listener's
@@ -872,26 +904,26 @@
     const st = Audio ? Audio.state() : null;
     let note = '';
     if (st && !st.supported) {
-      note = 'Peramban ini tidak bisa membacakan teks, jadi terjemahan tampil sebagai teks saja.';
+      note = t('audio.noVoiceSupport');
     } else if (st && st.disabled) {
-      note = 'Suara dimatikan sementara karena beberapa kalimat gagal dibacakan. Teksnya tetap lengkap.';
+      note = t('audio.voiceDisabled');
     } else if (cur === 'both') {
-      note = 'Anda mendengar ruangan pelan di bawah suara terjemahan.';
+      note = t('audio.both');
     } else if (cur === 'original') {
-      note = 'Tidak ada suara terjemahan. Semua tetap tampil sebagai teks.';
+      note = t('audio.original');
     } else {
-      note = 'Anda hanya mendengar suara terjemahan.';
+      note = t('audio.translation');
     }
     return `
       <div id="${esc(id)}" data-mode="${esc(cur)}" class="p-3 rounded-xl bg-zinc-900 space-y-2">
         <div class="flex items-center gap-2">
-          <span class="text-xs uppercase tracking-wide text-zinc-500">Yang Anda dengar</span>
+          <span class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('audio.youHear'))}</span>
           <span class="flex-1"></span>
-          ${st && st.speaking ? '<span class="text-[11px] text-emerald-400">membacakan…</span>' : ''}
+          ${st && st.speaking ? `<span class="text-[11px] text-emerald-400">${esc(t('audio.speaking'))}</span>` : ''}
         </div>
         <div class="grid grid-cols-3 gap-1.5">
           ${modes.map((m) => {
-            const c = AUDIO_MODE_COPY[m] || { icon: '🔈', label: m, hint: '' };
+            const c = audioModeCopy(m);
             const on = m === cur;
             return `
               <button data-audio-mode="${esc(m)}" aria-pressed="${on ? 'true' : 'false'}"
@@ -1005,7 +1037,7 @@
     } else if (tr && tr.status === 'ok') {
       translationBlock = `<p class="translation text-sm text-zinc-100">${esc(tr.text)}</p>
         ${audioFellBack(u, tr)
-          ? '<p class="audio-fallback text-[11px] text-amber-400/80 mt-1">Tidak bisa dibacakan di perangkat ini. Teksnya lengkap di atas.</p>'
+          ? `<p class="audio-fallback text-[11px] text-amber-400/80 mt-1">${esc(t('audio.cannotSpeak'))}</p>`
           : ''}
         ${tr.latencyMs != null ? `<p class="text-[11px] text-zinc-700 mt-1">${tr.latencyMs} ms</p>` : ''}`;
     } else if (tr && tr.status === 'partial') {
@@ -1160,6 +1192,24 @@
     </div>`;
   }
 
+  // Alone in a room, translation looks broken: you speak and nothing comes
+  // back, because with nobody else listening there is no target language to
+  // translate into. Say which of the two situations this is, since the fix is
+  // different: wait for someone, or change your own pair.
+  function soloNoteHTML() {
+    if (!S.isMember || S.demo.active) return '';
+    if (S.participantCount > 1) return '';
+    const speaks = S.prefs.speaksLang;
+    const hears = S.hearsLang || S.prefs.hearsLang;
+    const same = speaks === hears;
+    return `<p id="solo-note" data-same="${same ? 'true' : 'false'}"
+       class="text-xs ${same ? 'text-amber-400/80' : 'text-zinc-500'} px-1">${
+      esc(same
+        ? t('demo.soloSame', { speaks: langOf(speaks).label })
+        : t('demo.soloNote', { lang: langOf(hears).label }))
+    }</p>`;
+  }
+
   function composerHTML() {
     if (!S.isMember) {
       return `
@@ -1209,6 +1259,7 @@
         : '';
       return `
         <div class="space-y-2">
+          ${soloNoteHTML()}
           ${queueLineTyped}
           <div id="stt-unsupported" class="p-2.5 rounded-lg bg-zinc-900 text-xs text-zinc-400">
             Peramban ini tidak punya pengenalan suara, jadi mikrofon dimatikan.
@@ -1237,6 +1288,7 @@
       : '';
     return `
       <div class="space-y-2">
+        ${soloNoteHTML()}
         ${queueLine}
         <p id="mic-error" class="hidden text-xs text-amber-400"></p>
         <p id="interim" class="hidden text-sm text-zinc-500 italic px-1"></p>
@@ -1316,7 +1368,9 @@
       ${header(room.title, {
         back: '/',
         subtitle: `${purposeDef ? `${purposeDef.icon} ${purposeDef.label} · ` : ''}${room.code} · ${tierOf().label}`,
-        right: `<button id="open-langs" class="un-touch-target text-xs px-2 py-1 rounded-full bg-zinc-800">${langOf(S.prefs.speaksLang).flag}→${langOf(S.hearsLang).flag}</button>`,
+        // The badge comes before the language pill: whatever else this screen
+        // looks like, it says up front that nothing here is live.
+        right: `${S.demo.active ? `<span id="demo-badge" class="text-[11px] px-2 py-1 rounded-full bg-violet-600/20 text-violet-300">${esc(t('demo.badge'))}</span>` : ''}<button id="open-langs" class="un-touch-target text-xs px-2 py-1 rounded-full bg-zinc-800">${langOf(S.prefs.speaksLang).flag}→${langOf(S.hearsLang).flag}</button>`,
       })}
       <main class="max-w-2xl mx-auto px-4 py-4 space-y-4"
             style="padding-bottom: calc(2rem + var(--un-safe-inset-bottom, env(safe-area-inset-bottom, 0px)))">
@@ -1324,7 +1378,12 @@
         ${!S.connected ? `<div id="reconnect-notice" class="p-2.5 rounded-lg bg-amber-500/10 text-amber-300 text-xs">${reconnectCopy()}</div>` : ''}
         ${room.endedAt ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">This call has ended.</div>` : ''}
         ${room.mode === 'transcript_only' ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-300 text-xs">Transcript-only mode: everything is captured in the original language, nothing is translated.</div>` : ''}
-        ${S.config && !S.config.llmEnabled ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">Live translation is unavailable in this environment. Captions show the original language.</div>` : ''}
+        ${S.demo.active
+          // In the demo every caption is written down, so the environment
+          // notice would be answering a question nobody asked. Say what this
+          // screen actually is instead.
+          ? `<div id="demo-blurb" class="p-2.5 rounded-lg bg-violet-600/10 text-violet-200 text-xs">${esc(t('demo.blurb'))}</div>`
+          : S.config && !S.config.llmEnabled ? `<div class="p-2.5 rounded-lg bg-zinc-800 text-zinc-400 text-xs">Live translation is unavailable in this environment. Captions show the original language.</div>` : ''}
         ${budgetNoticeHTML()}
 
         ${floorHTML()}
@@ -1339,7 +1398,7 @@
             : `<p class="text-sm text-zinc-600 py-8 text-center">Nothing said yet. When someone speaks, their words appear here in ${esc(langOf(S.hearsLang).label)}.</p>`}
         </div>
 
-        ${composerHTML()}
+        ${S.demo.active ? demoComposerHTML() : composerHTML()}
 
         ${isHost ? hostLatencyHTML() : ''}
 
@@ -1354,8 +1413,9 @@
 
         ${rosterHTML()}
 
-        ${dialInHTML()}
+        ${S.demo.active ? '' : dialInHTML()}
 
+        ${S.demo.active ? '' : `
         <div class="pt-2 text-center">
           <p class="text-[11px] text-zinc-700">Share this call: code <span class="font-mono text-zinc-500">${esc(room.code)}</span></p>
           <p class="text-[11px] text-zinc-700">
@@ -1363,11 +1423,12 @@
                data-nav="/feedback?room=${esc(room.code)}&purpose=${esc(room.purpose || '')}"
                class="underline decoration-zinc-800">${esc(t('feedback.title'))}</a>
           </p>
-        </div>
+        </div>`}
       </main>`;
 
     bindNav(appEl());
-    bindRoomEvents();
+    if (S.demo.active) bindDemoEvents();
+    else bindRoomEvents();
     const feed = document.getElementById('feed');
     if (feed && atBottom) feed.scrollTop = feed.scrollHeight;
   }
@@ -1677,6 +1738,82 @@
   }
 
   // --- the poll loop -------------------------------------------------------
+  // Fold one /stream payload into client state and report which captions
+  // just became readable. Extracted from poll() so the demo can drive the
+  // real screen from fixtures: whatever it hands in here is exactly what a
+  // poll would have handed in, so there is one rendering path, not two.
+  function applyStream(data) {
+    const before = S.cursor;
+    S.room = data.room;
+    S.me = data.me;
+    S.isMember = data.isMember;
+    S.hearsLang = data.hearsLang || S.prefs.hearsLang;
+    S.tier = data.tier || S.tier;
+    S.rosterMode = data.rosterMode || 'full';
+    S.participantCount = data.participantCount || 0;
+    S.langGroups = data.langGroups || [];
+    S.activeSpeakers = data.activeSpeakers || [];
+    S.queue = data.queue || [];
+    S.myQueuePosition = data.myQueuePosition || null;
+    S.budget = data.budget || null;
+    S.dialIn = data.dialIn || S.dialIn;
+
+    if (data.me) {
+      // The room row is the truth while you are in a room; keep the local
+      // preference in step so the composer labels do not lie.
+      S.prefs.speaksLang = data.me.speaksLang;
+      S.prefs.hearsLang = data.me.hearsLang;
+    }
+
+    for (const p of data.participants || []) S.participants.set(p.userId, p);
+
+    const fresh = [];
+    for (const u of data.utterances || []) {
+      const prev = S.utterances.get(u.id);
+      S.utterances.set(u.id, u);
+      const tr = (u.translations || []).find((t) => t.targetLang === S.hearsLang);
+      const wasReady = prev && (prev.translations || []).some(
+        (t) => t.targetLang === S.hearsLang && t.status === 'ok'
+      );
+      if (tr && tr.status === 'ok' && !wasReady) fresh.push(u);
+    }
+    // Cap the feed so a long call does not grow the DOM without bound.
+    if (S.utterances.size > 120) {
+      const ids = Array.from(S.utterances.keys()).sort((a, b) => a - b);
+      for (const id of ids.slice(0, S.utterances.size - 120)) S.utterances.delete(id);
+    }
+    S.cursor = data.seq;
+    if (data.seq !== before) S.lastChangeAt = Date.now();
+    return { before, fresh };
+  }
+
+  // Play new captions out loud. Stage 3 (one-way rooms) restricts this to
+  // the people who actually hold the floor; Stage 4 (two-way) plays
+  // everyone. Never play our own words back at ourselves.
+  function speakFresh(fresh) {
+    if (S.room && !S.room.endedAt) {
+      for (const u of fresh) {
+        if (S.spokenIds.has(u.id)) continue;
+        // Marked spoken even when we stay silent, so a caption that was
+        // already on screen while the tab was hidden is never read out
+        // minutes late when the tab comes back.
+        S.spokenIds.add(u.id);
+        if (S.suppressTts) continue;
+        const tr = (u.translations || []).find((t) => t.targetLang === S.hearsLang);
+        // Only SEALED text is spoken. A sealed clause is immutable, which is
+        // what lets the voice start before the sentence is finished; an
+        // unsealed tail is provisional and is never offered. The bus applies
+        // the listening mode, dedupes clauses it already spoke while the
+        // caption was streaming, and drops the rest of the guards.
+        if (tr && tr.status === 'ok') offerAudio(u, tr, true);
+      }
+    }
+    S.suppressTts = false;
+    // An utterance that was offered but never got a voice degrades to text
+    // here rather than sitting silent forever.
+    if (Audio) Audio.sweep();
+  }
+
   async function poll(opts) {
     if (!S.route || S.route.name !== 'room') return;
     try {
@@ -1701,20 +1838,7 @@
         renderRoomNotFound();
         return;
       }
-      const before = S.cursor;
-      S.room = data.room;
-      S.me = data.me;
-      S.isMember = data.isMember;
-      S.hearsLang = data.hearsLang || S.prefs.hearsLang;
-      S.tier = data.tier || S.tier;
-      S.rosterMode = data.rosterMode || 'full';
-      S.participantCount = data.participantCount || 0;
-      S.langGroups = data.langGroups || [];
-      S.activeSpeakers = data.activeSpeakers || [];
-      S.queue = data.queue || [];
-      S.myQueuePosition = data.myQueuePosition || null;
-      S.budget = data.budget || null;
-      S.dialIn = data.dialIn || S.dialIn;
+      const { fresh } = applyStream(data);
       if (!S.connected) {
         // Say it landed. A banner that only ever appears when things are
         // broken leaves you guessing about the moment they stop being broken.
@@ -1732,63 +1856,13 @@
       if (wait) S.lastHoldMs = Math.max(0, receivedAt - requestedAt);
       S.error = null;
 
-      if (data.me) {
-        // The room row is the truth while you are in a room; keep the local
-        // preference in step so the composer labels do not lie.
-        S.prefs.speaksLang = data.me.speaksLang;
-        S.prefs.hearsLang = data.me.hearsLang;
-      }
-
-      for (const p of data.participants) S.participants.set(p.userId, p);
-
-      const fresh = [];
-      for (const u of data.utterances) {
-        const prev = S.utterances.get(u.id);
-        S.utterances.set(u.id, u);
-        const tr = (u.translations || []).find((t) => t.targetLang === S.hearsLang);
-        const wasReady = prev && (prev.translations || []).some(
-          (t) => t.targetLang === S.hearsLang && t.status === 'ok'
-        );
-        if (tr && tr.status === 'ok' && !wasReady) fresh.push(u);
-      }
-      // Cap the feed so a long call does not grow the DOM without bound.
-      if (S.utterances.size > 120) {
-        const ids = Array.from(S.utterances.keys()).sort((a, b) => a - b);
-        for (const id of ids.slice(0, S.utterances.size - 120)) S.utterances.delete(id);
-      }
-      S.cursor = data.seq;
-      if (data.seq !== before) S.lastChangeAt = Date.now();
-
       noteTranslateLatency(data.events);
       noteDelivery(data.events, requestedAt, receivedAt);
       // Sealed clauses of captions still being written. This is the whole
       // latency win: clause 1 is spoken while clause 2 is still arriving.
       if (S.room && !S.room.endedAt) noteSegments(data.events);
 
-      // Play new captions out loud. Stage 3 (one-way rooms) restricts this to
-      // the people who actually hold the floor; Stage 4 (two-way) plays
-      // everyone. Never play our own words back at ourselves.
-      if (S.room && !S.room.endedAt) {
-        for (const u of fresh) {
-          if (S.spokenIds.has(u.id)) continue;
-          // Marked spoken even when we stay silent, so a caption that was
-          // already on screen while the tab was hidden is never read out
-          // minutes late when the tab comes back.
-          S.spokenIds.add(u.id);
-          if (S.suppressTts) continue;
-          const tr = (u.translations || []).find((t) => t.targetLang === S.hearsLang);
-          // Only SEALED text is spoken. A sealed clause is immutable, which is
-          // what lets the voice start before the sentence is finished; an
-          // unsealed tail is provisional and is never offered. The bus applies
-          // the listening mode, dedupes clauses it already spoke while the
-          // caption was streaming, and drops the rest of the guards.
-          if (tr && tr.status === 'ok') offerAudio(u, tr, true);
-        }
-      }
-      S.suppressTts = false;
-      // An utterance that was offered but never got a voice degrades to text
-      // here rather than sitting silent forever.
-      if (Audio) Audio.sweep();
+      speakFresh(fresh);
 
       if (S.room.endedAt && S.route.name === 'room') {
         Speech.stop(); Voice.clear();
@@ -1905,12 +1979,20 @@
     S.pollTimer = null;
   }
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && S.route && S.route.name === 'room') {
+    if (document.hidden || !S.route) return;
+    if (S.route.name === 'room') {
       // Whatever arrived while we were away is history now — show it, do not
       // perform it. Anything that lands after this poll is spoken normally.
       S.suppressTts = true;
       Voice.clear();
       poll();
+      return;
+    }
+    // Background timers are throttled, so the replay drifts behind the clock
+    // while the tab is away. Resync to where it should be, silently, for the
+    // same reason: catching up out loud is a monologue nobody asked for.
+    if (S.route.name === 'demo' && S.demo.active && S.demo.play && !S.demo.paused && !S.demo.finished) {
+      demoRebuild(demoElapsed());
     }
   });
 
@@ -2580,123 +2662,617 @@
   }
 
   // --- the scripted demo call ----------------------------------------------
+  // A recorded conversation replayed through the REAL call screen. Every frame
+  // below is a synthesised /api/rooms/:code/stream payload handed to
+  // applyStream(), so the roster, the floor, the audio-mode selector, the
+  // clause sealing and the captions are the production code path rather than a
+  // drawing of it. If the room screen regresses, the demo regresses with it,
+  // which is the only way a demo stays honest.
+  //
   // Entirely client side: no API calls, no rows, no LLM spend. That is why it
-  // is NOT gated on staging — it is not data, it is a rehearsal, and the
+  // is NOT gated on staging: it is not data, it is a rehearsal, and the
   // "before" screenshot of any later change to it is taken from production.
+
+  const DEMO_SCRIPT_LABEL = {
+    onboarding: 'demo.scriptOnboarding',
+    townhall: 'demo.scriptTownhall',
+  };
+
+  function demoScripts() {
+    const list = (S.config && S.config.demo) || [];
+    return Array.isArray(list) ? list.filter((s) => s && Array.isArray(s.turns) && s.turns.length) : [];
+  }
+
   function stopDemo() {
     for (const id of S.demo.timers) clearTimeout(id);
     S.demo.timers = [];
-    S.demo.running = false;
+    S.demo.active = false;
+    S.demo.paused = false;
+    S.demo.finished = false;
+    // The demo borrowed the room state; hand it back so a real call opened
+    // next does not inherit a tier and a hearing language it never chose.
+    S.hearsLang = S.prefs.hearsLang;
+    S.tier = null;
+    S.rosterMode = 'full';
+    S.langGroups = [];
+    S.activeSpeakers = [];
+    S.queue = [];
+    S.participantCount = 0;
   }
   function demoLater(fn, ms) {
-    S.demo.timers.push(setTimeout(fn, ms));
+    S.demo.timers.push(setTimeout(fn, Math.max(0, ms)));
   }
 
-  // The same rule the server applies in lib/segment.js, in miniature: a clause
-  // is only spoken once it can no longer be rewritten.
-  function demoClauses(text) {
-    const parts = String(text).split(/(?<=[,.;!?])\s+/).filter(Boolean);
-    return parts.length ? parts : [String(text)];
+  function demoTier(script) {
+    const tiers = (S.config && S.config.tiers) || [];
+    return tiers.find((x) => x.key === script.tier)
+      || tiers[0]
+      || { key: script.tier, label: script.tier, speakerSlots: 1, maxTargetLangs: 2, pollActiveMs: 900 };
   }
 
-  function demoCardHTML(turn, idx, script) {
-    const sp = script.speakers[turn.speaker] || { name: turn.speaker, flag: '🏳️' };
-    return `
-      <article class="utterance fade-in p-3 rounded-xl bg-zinc-900" data-utterance-id="demo-${idx}">
-        <div class="flex items-center gap-2 text-xs text-zinc-500 mb-1">
-          <span>${sp.flag}</span><span>${esc(sp.name)}</span>
-          <span class="text-zinc-700">${esc(langOf(turn.lang).label)} → ${esc(langOf(turn.targetLang).label)}</span>
-        </div>
-        <p class="original text-sm text-zinc-400">${esc(turn.text)}</p>
-        <p class="translation text-sm mt-1" data-demo-translation="${idx}"></p>
-      </article>`;
+  // Which languages this script can actually be watched in: the ones it has
+  // captions for, intersected with the ones the app ships. A language on the
+  // coming-soon list has no captions and is not offered.
+  function demoLangs(script) {
+    const first = script.turns[0] || {};
+    const have = Object.keys(first.captions || {});
+    const known = ((S.config && S.config.languages) || []).map((l) => l.code);
+    return have.filter((c) => known.includes(c));
+  }
+
+  function demoPickLang(script, want) {
+    const langs = demoLangs(script);
+    if (want && langs.includes(want)) return want;
+    const pref = S.prefs && S.prefs.hearsLang;
+    if (pref && langs.includes(pref)) return pref;
+    return langs[0] || 'en';
+  }
+
+  // The clauses of one turn as the viewer will read them. A viewer who already
+  // speaks the source language reads the original, which is exactly what the
+  // room screen shows in that case.
+  function demoClauses(turn, hears) {
+    const arr = turn.captions[hears] || turn.captions[turn.lang] || [];
+    return arr.length ? arr : [''];
+  }
+
+  // The replay as a list of frames. Each frame is one /stream payload: which
+  // turns are settled, and how much of the one still arriving has sealed.
+  // Playing the demo is nothing but handing these to applyStream() on a timer.
+  function demoFrames(script, hears) {
+    const frames = [];
+    let at = 0;
+    script.turns.forEach((turn, i) => {
+      at += (turn.gapMs || 1200) + (turn.captureMs || 900);
+      const showAt = at;
+      if (hears === turn.lang) {
+        // Nothing to translate, so there is no translation leg to watch.
+        frames.push({ at: showAt, upto: i + 1, streaming: null });
+        return;
+      }
+      // The sentence is transcribed before its translation exists.
+      frames.push({ at: showAt, upto: i, streaming: { idx: i, sealed: 0 } });
+      const clauses = demoClauses(turn, hears);
+      const translate = turn.translateMs || 600;
+      const step = Math.max(220, Math.round(translate / clauses.length));
+      for (let c = 0; c < clauses.length; c += 1) {
+        const sealed = c + 1;
+        at = showAt + translate + step * c;
+        frames.push(sealed === clauses.length
+          ? { at, upto: i + 1, streaming: null }
+          : { at, upto: i, streaming: { idx: i, sealed } });
+      }
+    });
+    return frames;
+  }
+
+  // The wall-clock instant the replay's zero mark sits at. Captions carry a
+  // real timestamp derived from it, so a settled deep link reads as a
+  // conversation that just happened rather than one due to happen.
+  function demoBase() {
+    return S.demo.playingSince || S.demo.startedAt;
+  }
+
+  function demoRoom(script) {
+    return {
+      code: script.code,
+      title: script.title,
+      purpose: script.purpose,
+      scaleTier: script.tier,
+      tier: demoTier(script),
+      hostUserId: script.hostUserId,
+      hostUsername: script.hostUsername,
+      twoWay: !!script.twoWay,
+      mode: 'full',
+      seq: S.demo.seq,
+      createdAt: new Date(demoBase()).toISOString(),
+      endedAt: null,
+      endReason: null,
+      activeSpeakerUserId: null,
+      ephemeral: false,
+    };
+  }
+
+  function demoParticipants(script) {
+    return (script.participants || []).map((p) => ({
+      userId: p.userId,
+      username: p.username,
+      speaksLang: p.speaksLang,
+      hearsLang: p.hearsLang,
+      micOn: false,
+      role: p.role,
+      ttsEnabled: true,
+      audioMode: 'both',
+      handRaisedAt: null,
+      mutedByHost: false,
+      removed: false,
+      left: false,
+      online: true,
+      seq: 1,
+    }));
+  }
+
+  // A large room sends language GROUPS instead of rows. The viewer is watching
+  // without having joined, so they are not in the roster; their language only
+  // shows up as a group when the room has room for it under the tier cap,
+  // which is the same ceiling join enforces.
+  function demoLangGroups(script) {
+    if (script.rosterMode !== 'aggregate') return [];
+    const groups = (script.langGroups || []).map((g) => ({ ...g }));
+    if (groups.some((g) => g.lang === S.demo.hears)) return groups;
+    const max = Math.min(
+      demoTier(script).maxTargetLangs || 4,
+      (S.config && S.config.limits && S.config.limits.MAX_TARGET_LANGS) || 4
+    );
+    if (groups.length >= max) return groups;
+    return groups.concat([{ lang: S.demo.hears, size: 1, hands: 0, status: 'ok' }]);
+  }
+
+  // One /stream utterance, in exactly the shape lib/stream.js assembles.
+  // Numeric ids, because everything downstream is keyed by one: S.spokenIds,
+  // the audio bus, and the no-tts-for-partial-captions invariant's Number()
+  // read of data-utterance-id.
+  function demoUtterance(script, idx, opts) {
+    const o = opts || {};
+    const turn = script.turns[idx];
+    const sp = script.speakers[turn.speaker];
+    const target = S.demo.hears;
+    const u = {
+      id: 900000 + idx,
+      speakerUserId: sp.userId,
+      speakerUsername: sp.name,
+      sourceLang: turn.lang,
+      sourceText: (turn.captions[turn.lang] || []).join(''),
+      retracted: false,
+      via: 'voice',
+      seq: idx + 1,
+      createdAt: new Date(demoBase() + (S.demo.showAt[idx] || 0)).toISOString(),
+      translations: [],
+    };
+    // Already in the viewer's language: the room screen says so and shows the
+    // original, and no translation row was ever written for it.
+    if (target === turn.lang) return u;
+
+    const clauses = demoClauses(turn, target);
+    const status = o.status || 'ok';
+    const tr = {
+      targetLang: target,
+      text: '',
+      status,
+      latencyMs: null,
+      ttftMs: null,
+      groupSize: script.rosterMode === 'aggregate' ? 60 : 1,
+      ageMs: 0,
+      segments: [],
+      sealedIdx: 0,
+      audioAgeMs: 0,
+    };
+    if (status === 'ok') {
+      tr.text = clauses.join('');
+      tr.segments = clauses;
+      tr.sealedIdx = clauses.length;
+      tr.latencyMs = turn.translateMs || null;
+      tr.ttftMs = Math.round((turn.translateMs || 600) / 2);
+    } else if (status === 'partial') {
+      const sealed = Math.max(1, Math.min(Number(o.sealed) || 1, clauses.length));
+      tr.text = clauses.slice(0, sealed).join('');
+      tr.segments = clauses.slice(0, sealed);
+      tr.sealedIdx = sealed;
+    }
+    // 'pending', 'unavailable' and 'error' carry no text at all, which is what
+    // makes each of them its own caption state on screen rather than a blank.
+    u.translations = [tr];
+    return u;
+  }
+
+  function demoPayload(script, frame) {
+    const utterances = [];
+    for (let i = 0; i < frame.upto; i += 1) {
+      utterances.push(demoUtterance(script, i, { status: 'ok' }));
+    }
+    const events = [];
+    if (frame.streaming) {
+      const st = frame.streaming;
+      const status = st.status || (st.sealed > 0 ? 'partial' : 'pending');
+      const u = demoUtterance(script, st.idx, { status, sealed: st.sealed });
+      utterances.push(u);
+      const tr = u.translations[0];
+      // Sealed clauses of a caption still being written. The bus speaks clause
+      // one while clause two is still arriving, exactly as in a real call.
+      if (tr && status === 'partial') {
+        events.push({
+          type: 'translation.segment',
+          seq: S.demo.seq + 1,
+          utteranceId: u.id,
+          targetLang: tr.targetLang,
+          segments: tr.segments,
+          sealedIdx: tr.sealedIdx,
+          final: false,
+          audioAgeMs: 0,
+        });
+      }
+    }
+    const speaking = frame.streaming ? script.turns[frame.streaming.idx] : null;
+    const holder = speaking ? script.speakers[speaking.speaker] : null;
+    S.demo.seq += 1;
+    return {
+      room: demoRoom(script),
+      me: null,
+      isMember: false,
+      hearsLang: S.demo.hears,
+      seq: S.demo.seq,
+      tier: demoTier(script),
+      rosterMode: script.rosterMode || 'full',
+      participantCount: script.participantCount || (script.participants || []).length,
+      langGroups: demoLangGroups(script),
+      // One holder at most, which is inside every tier's slot count. The
+      // speaker-slots-within-tier-cap invariant reads exactly this.
+      activeSpeakers: holder ? [{ userId: holder.userId, username: holder.name, until: null }] : [],
+      queue: script.queue || [],
+      myQueuePosition: null,
+      budget: null,
+      participants: demoParticipants(script),
+      events,
+      utterances,
+    };
+  }
+
+  // The demo's equivalent of one poll landing. Telemetry is deliberately not
+  // here: nothing was delivered over a network and nothing was translated, so
+  // there is no latency sample to take and nothing to report.
+  function demoApply(frame) {
+    const script = S.demo.script;
+    if (!script) return;
+    const data = demoPayload(script, frame);
+    const { fresh } = applyStream(data);
+    noteSegments(data.events);
+    speakFresh(fresh);
+    renderRoom();
+  }
+
+  // Everything on screen at once, settled. This is what ?play=0 paints and
+  // what "skip to the end" jumps to, and it is deliberately timer-free so a
+  // screenshot or a headless check sees a DOM that has stopped moving.
+  function demoEnd() {
+    for (const id of S.demo.timers) clearTimeout(id);
+    S.demo.timers = [];
+    S.demo.finished = true;
+    S.demo.paused = false;
+    const script = S.demo.script;
+    const frames = S.demo.frames;
+    const total = frames.length ? frames[frames.length - 1].at : 0;
+    S.demo.playingSince = Date.now() - total;
+    S.demo.pausedAt = total;
+    // A deep link may pin the last caption to one of the states the room
+    // screen has to be able to explain, so each of them can be pointed at.
+    // It has to be a turn that is actually being translated: a sentence
+    // already in the viewer's language has no translation row to hold in a
+    // state, so pick the last one that does.
+    let held = -1;
+    for (let i = script.turns.length - 1; i >= 0; i -= 1) {
+      if (script.turns[i].lang !== S.demo.hears) { held = i; break; }
+    }
+    const frame = S.demo.state && held >= 0
+      ? { upto: held, streaming: { idx: held, status: S.demo.state, sealed: 1 } }
+      : { upto: script.turns.length, streaming: null };
+    demoApply(frame);
+  }
+
+  function demoPlayFrom(elapsed) {
+    for (const id of S.demo.timers) clearTimeout(id);
+    S.demo.timers = [];
+    S.demo.paused = false;
+    S.demo.finished = false;
+    const startedAt = Date.now() - elapsed;
+    S.demo.playingSince = startedAt;
+    const pending = S.demo.frames.filter((f) => f.at > elapsed);
+    if (!pending.length) { demoEnd(); return; }
+    for (const frame of pending) {
+      demoLater(() => {
+        if (!S.demo.active || !S.route || S.route.name !== 'demo') return;
+        demoApply(frame);
+        if (frame === S.demo.frames[S.demo.frames.length - 1]) {
+          S.demo.finished = true;
+          renderRoom();
+        }
+      }, frame.at - elapsed);
+    }
+  }
+
+  function demoElapsed() {
+    if (S.demo.paused || !S.demo.playingSince) return S.demo.pausedAt || 0;
+    return Date.now() - S.demo.playingSince;
+  }
+
+  function demoPause() {
+    S.demo.pausedAt = demoElapsed();
+    S.demo.paused = true;
+    for (const id of S.demo.timers) clearTimeout(id);
+    S.demo.timers = [];
+    Voice.clear();
+    if (Audio) Audio.clear();
+    renderRoom();
+  }
+
+  // Rebuild the timeline and resume where we were. Used by the language
+  // switch: the clause count of a turn depends on the language it is read in,
+  // so the frames are not the same frames.
+  function demoRebuild(elapsed) {
+    const script = S.demo.script;
+    S.demo.frames = demoFrames(script, S.demo.hears);
+    S.utterances.clear();
+    S.spokenIds.clear();
+    S.offeredSegments.clear();
+    S.latency.byKey.clear();
+    S.cursor = 0;
+    if (Audio) Audio.reset();
+    Voice.clear();
+    // Everything before the resume point is history: paint it settled, and
+    // do not read any of it out loud.
+    S.suppressTts = true;
+    const past = S.demo.frames.filter((f) => f.at <= elapsed);
+    demoApply(past.length ? past[past.length - 1] : { upto: 0, streaming: null });
+    S.suppressTts = false;
+    if (S.demo.paused) { S.demo.pausedAt = elapsed; renderRoom(); return; }
+    demoPlayFrom(elapsed);
+  }
+
+  function demoSetParam(key, value) {
+    const url = new URL(location.href);
+    if (value == null) url.searchParams.delete(key);
+    else url.searchParams.set(key, value);
+    history.replaceState({}, '', url.pathname + url.search);
   }
 
   function renderDemo() {
     stopDemo();
-    const script = (S.config && S.config.demo) || null;
-    if (!script || !Array.isArray(script.turns) || !script.turns.length) {
-      appEl().innerHTML = `${header(t('lobby.demo'), { back: '/' })}
+    const scripts = demoScripts();
+    if (!scripts.length) {
+      appEl().innerHTML = `${header(t('demo.title'), { back: '/' })}
         <main class="max-w-2xl mx-auto px-4 py-16 text-center text-sm text-zinc-500">${esc(t('common.none'))}</main>`;
       bindNav(appEl());
       return;
     }
-    const purposeDef = ((S.config && S.config.purposes) || []).find((p) => p.key === script.purpose);
-    appEl().innerHTML = `
-      ${header(t('lobby.demo'), {
-        back: '/',
-        subtitle: purposeDef ? `${purposeDef.icon} ${purposeDef.label}` : '',
-        right: '<span class="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 text-[11px]">Demo</span>',
-      })}
-      <main class="max-w-2xl mx-auto px-4 py-4 space-y-4"
-            style="padding-bottom: calc(2rem + var(--un-safe-inset-bottom, env(safe-area-inset-bottom, 0px)))">
-        <p class="text-sm text-zinc-400">${esc(t('lobby.demoBlurb'))}</p>
-        <div id="feed" class="space-y-2">
-          ${demoCardHTML(script.turns[0], 0, script)}
-        </div>
+    const q = new URLSearchParams(location.search);
+    const script = scripts.find((s) => s.key === q.get('script')) || scripts[0];
+    const state = ['partial', 'pending', 'unavailable'].includes(q.get('state')) ? q.get('state') : null;
+    // A pinned caption state IS the settled view: there is nothing left to
+    // play once the last caption is being held in one.
+    const play = q.get('play') !== '0' && !state;
+
+    S.demo.active = true;
+    S.demo.script = script;
+    S.demo.hears = demoPickLang(script, q.get('hears'));
+    S.demo.play = play;
+    S.demo.state = state;
+    S.demo.paused = false;
+    S.demo.finished = false;
+    S.demo.pausedAt = 0;
+    S.demo.playingSince = 0;
+    S.demo.seq = 0;
+    S.demo.startedAt = Date.now();
+    S.demo.frames = demoFrames(script, S.demo.hears);
+    // When each sentence was said, so a caption's own age is consistent
+    // between frames rather than moving under it.
+    S.demo.showAt = [];
+    let seen = -1;
+    S.demo.frames.forEach((f) => {
+      const idx = f.streaming ? f.streaming.idx : f.upto - 1;
+      if (idx > seen) { S.demo.showAt[idx] = f.at; seen = idx; }
+    });
+
+    S.utterances.clear();
+    S.participants.clear();
+    S.spokenIds.clear();
+    S.offeredSegments.clear();
+    S.latency.byKey.clear();
+    S.cursor = 0;
+    S.connected = true;
+    S.error = null;
+    if (Audio) Audio.reset();
+
+    if (!play) { demoEnd(); return; }
+    // Paint the room before the first sentence lands, so the chrome is there
+    // to watch the conversation arrive into.
+    demoApply({ upto: 0, streaming: null });
+    demoPlayFrom(0);
+  }
+
+  // The demo's composer: the transport, the two scenarios, the language it is
+  // being watched in, and the way out into a call of your own.
+  function demoComposerHTML() {
+    const script = S.demo.script;
+    const scripts = demoScripts();
+    const langs = demoLangs(script);
+    const paused = S.demo.paused || S.demo.finished || !S.demo.play;
+    const chip = 'un-pressable px-3 py-2 rounded-lg text-xs ring-1';
+    return `
+      <div class="space-y-3">
+        <p id="demo-watching" class="text-xs text-zinc-500 px-1">
+          ${esc(t('demo.watching', { lang: langOf(S.demo.hears).label }))}
+        </p>
+
         <div class="flex gap-2">
-          <button id="demo-restart" class="un-pressable flex-1 py-3 rounded-xl bg-zinc-900 text-sm">${esc(t('common.retry'))}</button>
-          <button id="start-real-call" data-nav="/" class="un-pressable flex-1 py-3 rounded-xl bg-violet-600 text-white text-sm font-semibold">
-            ${esc(t('lobby.start'))}
+          <button id="demo-toggle" class="un-pressable flex-1 py-2.5 rounded-xl bg-violet-600 text-white text-sm font-medium">
+            ${esc(paused ? t('demo.play') : t('demo.pause'))}
           </button>
+          <button id="demo-restart" class="un-pressable px-4 py-2.5 rounded-xl bg-zinc-800 text-sm">${esc(t('demo.restart'))}</button>
+          <button id="demo-skip" class="un-pressable px-4 py-2.5 rounded-xl bg-zinc-800 text-sm">${esc(t('demo.skipEnd'))}</button>
         </div>
-      </main>`;
-    bindNav(appEl());
-    const restart = document.getElementById('demo-restart');
-    if (restart) restart.addEventListener('click', () => renderDemo());
+        ${S.demo.finished ? `<p id="demo-ended" class="text-xs text-zinc-500 px-1">${esc(t('demo.ended'))}</p>` : ''}
 
-    // The first turn is complete on first paint. Everything after it is
-    // replayed clause by clause on the same code path a real caption takes.
-    const first = script.turns[0];
-    const firstClauses = demoClauses(first.translated);
-    const firstEl = document.querySelector('[data-demo-translation="0"]');
-    if (firstEl) firstEl.textContent = first.translated;
-    demoOffer(0, first, firstClauses, firstClauses.length, true);
+        <div class="space-y-1.5">
+          <p class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('demo.pickScript'))}</p>
+          <div id="demo-scripts" class="flex flex-wrap gap-2">
+            ${scripts.map((s) => `
+              <button data-demo-script="${esc(s.key)}"
+                      class="${chip} ${s.key === script.key ? 'bg-zinc-800 ring-violet-500 text-zinc-100' : 'bg-zinc-900 ring-zinc-800 text-zinc-400'}">
+                ${esc(t(DEMO_SCRIPT_LABEL[s.key] || 'demo.title'))}
+              </button>`).join('')}
+          </div>
+        </div>
 
-    S.demo.running = true;
-    let at = 0;
-    for (let i = 1; i < script.turns.length; i += 1) {
-      const turn = script.turns[i];
-      at += (turn.gapMs || 1200) + (turn.captureMs || 900);
-      const startAt = at;
-      demoLater(() => {
-        const feed = document.getElementById('feed');
-        if (!feed || !S.route || S.route.name !== 'demo') return;
-        feed.insertAdjacentHTML('beforeend', demoCardHTML(turn, i, script));
-      }, startAt);
-      const clauses = demoClauses(turn.translated);
-      const step = Math.max(220, Math.round((turn.translateMs || 600) / clauses.length));
-      for (let cIdx = 0; cIdx < clauses.length; cIdx += 1) {
-        const sealed = cIdx + 1;
-        const final = sealed === clauses.length;
-        at = startAt + (turn.translateMs || 600) + step * cIdx;
-        demoLater(() => {
-          if (!S.route || S.route.name !== 'demo') return;
-          const el = document.querySelector(`[data-demo-translation="${i}"]`);
-          if (!el) return;
-          el.textContent = clauses.slice(0, sealed).join(' ');
-          el.classList.toggle('partial', !final);
-          demoOffer(i, turn, clauses, sealed, final);
-        }, at);
+        <div class="space-y-1.5">
+          <p class="text-xs uppercase tracking-wide text-zinc-500">${esc(t('demo.pickLang'))}</p>
+          <div id="demo-langs" class="flex flex-wrap gap-2">
+            ${langs.map((c) => `
+              <button data-demo-lang="${esc(c)}"
+                      class="${chip} ${c === S.demo.hears ? 'bg-zinc-800 ring-violet-500 text-zinc-100' : 'bg-zinc-900 ring-zinc-800 text-zinc-400'}">
+                ${langOf(c).flag} ${esc(langOf(c).label)}
+              </button>`).join('')}
+          </div>
+        </div>
+
+        <div id="demo-try-card" class="p-3 rounded-xl bg-zinc-900 ring-1 ring-zinc-800 space-y-2">
+          <p class="text-sm font-medium">${esc(t('demo.try'))}</p>
+          <p class="text-xs text-zinc-500">${esc(t('demo.tryBlurb'))}</p>
+          <p class="text-xs text-zinc-500">${esc(t('demo.tryPair', {
+            speaks: langOf(S.prefs.speaksLang).label,
+            hears: langOf(demoPracticeHears()).label,
+          }))}</p>
+          ${S.config && !S.config.llmEnabled
+            ? `<p class="text-xs text-amber-400/80">${esc(t('demo.tryNoLlm'))}</p>` : ''}
+          <div class="flex gap-2 pt-0.5">
+            <button id="demo-try" class="un-pressable flex-1 py-2.5 rounded-lg bg-violet-600 text-white text-sm font-medium">
+              ${esc(t('demo.try'))}
+            </button>
+            <button id="demo-real" data-nav="/" class="un-pressable px-4 py-2.5 rounded-lg bg-zinc-800 text-sm">
+              ${esc(t('demo.startReal'))}
+            </button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // A practice call only says anything if the pair differs, so pick something
+  // to hear rather than opening a room that has nothing to translate.
+  function demoPracticeHears() {
+    const speaks = S.prefs.speaksLang;
+    if (S.prefs.hearsLang && S.prefs.hearsLang !== speaks) return S.prefs.hearsLang;
+    if (S.demo.hears && S.demo.hears !== speaks) return S.demo.hears;
+    const langs = ((S.config && S.config.languages) || []).map((l) => l.code);
+    return langs.find((c) => c !== speaks) || 'en';
+  }
+
+  // "Try it with your own voice" opens an ORDINARY room. Not a special mode,
+  // not a staging-only path: a real call with one person in it, which is the
+  // shape a first-time visitor was trying to test in the first place.
+  async function startPracticeCall(btn) {
+    btn.disabled = true;
+    try {
+      const held = sessionStorage.getItem('lt.practice');
+      if (held) {
+        // Reuse the practice room this browser already opened rather than
+        // burning a slot from the hourly cap on every tap.
+        const mine = await api('/api/rooms/mine').catch(() => ({ rooms: [] }));
+        if ((mine.rooms || []).some((r) => r.code === held)) { navigate(`/room/${held}`); return; }
+        sessionStorage.removeItem('lt.practice');
       }
+      const purposes = (S.config && S.config.purposes) || [];
+      const purpose = purposes.some((p) => p.key === 'onboarding') ? 'onboarding' : (purposes[0] || {}).key;
+      const r = await api('/api/rooms', {
+        method: 'POST',
+        body: {
+          title: t('demo.practiceTitle'),
+          purpose,
+          twoWay: true,
+          scaleTier: 'direct',
+          speaksLang: S.prefs.speaksLang,
+          hearsLang: demoPracticeHears(),
+        },
+      });
+      sessionStorage.setItem('lt.practice', r.room.code);
+      navigate(`/room/${r.room.code}`);
+    } catch (err) {
+      btn.disabled = false;
+      const tooMany = err.status === 429 || (err.data && err.data.error === 'too_many_rooms');
+      notify(tooMany ? t('demo.tooMany') : err.message);
     }
   }
 
-  // The demo speaks through the real bus, so a listener hears exactly what a
-  // real call sounds like — including that only sealed clauses ever go out.
-  function demoOffer(idx, turn, clauses, sealedIdx, final) {
-    if (!Audio) return;
-    try {
-      Audio.offer({
-        utteranceId: `demo-${idx}`,
-        targetLang: turn.targetLang,
-        ttsTag: langOf(turn.targetLang).tts,
-        segments: clauses,
-        sealedIdx,
-        final: !!final,
-        ageMs: 0,
+  function bindDemoEvents() {
+    const el = (id) => document.getElementById(id);
+
+    // The room chrome the demo keeps. The language sheet is the second way to
+    // change what you are watching in, and closing it re-renders the route,
+    // which restarts the replay in the language just chosen.
+    if (el('open-langs')) el('open-langs').addEventListener('click', openLanguageSheet);
+    appEl().querySelectorAll('#audio-mode [data-audio-mode]').forEach((b) => {
+      b.addEventListener('click', async () => {
+        await setAudioMode(b.dataset.audioMode);
+        renderRoom();
       });
-    } catch { /* a demo must never break on a device with no voice */ }
+    });
+    if (el('demo-toggle')) {
+      el('demo-toggle').addEventListener('click', () => {
+        if (S.demo.finished || !S.demo.play) {
+          // Play after the end is "watch it again", which is the only thing
+          // play can mean once there is nothing left to arrive.
+          demoSetParam('play', null);
+          demoSetParam('state', null);
+          renderDemo();
+          return;
+        }
+        if (S.demo.paused) demoPlayFrom(S.demo.pausedAt || 0);
+        else demoPause();
+        renderRoom();
+      });
+    }
+    if (el('demo-restart')) {
+      el('demo-restart').addEventListener('click', () => {
+        demoSetParam('play', null);
+        demoSetParam('state', null);
+        renderDemo();
+      });
+    }
+    if (el('demo-skip')) el('demo-skip').addEventListener('click', () => demoEnd());
+
+    document.querySelectorAll('[data-demo-script]').forEach((b) => {
+      b.addEventListener('click', () => {
+        if (b.dataset.demoScript === S.demo.script.key) return;
+        demoSetParam('script', b.dataset.demoScript);
+        renderDemo();
+      });
+    });
+
+    document.querySelectorAll('[data-demo-lang]').forEach((b) => {
+      b.addEventListener('click', () => {
+        const next = b.dataset.demoLang;
+        if (next === S.demo.hears) return;
+        const elapsed = demoElapsed();
+        S.demo.hears = next;
+        // Kept in the URL so the choice survives a reload and can be pointed
+        // at, and deliberately NOT written to the saved preference: watching
+        // the demo in Japanese is not a decision about your own calls.
+        demoSetParam('hears', next);
+        if (!S.demo.play) { demoEnd(); return; }
+        demoRebuild(elapsed);
+      });
+    });
+
+    if (el('demo-try')) {
+      el('demo-try').addEventListener('click', (e) => startPracticeCall(e.currentTarget));
+    }
   }
 
   // --- render --------------------------------------------------------------

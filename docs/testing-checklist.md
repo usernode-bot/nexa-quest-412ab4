@@ -34,7 +34,11 @@ Run every row. `n/a` in a cell is a result, not a skip.
 1. Open `/admin/compat`. Record every row of `#compat-table`.
 2. Open `/demo`. It needs no microphone, no room and no AI budget, so it is
    the fastest way to see whether captions render and whether the device
-   speaks them. Confirm captions appear and the reading voice starts.
+   speaks them. Confirm captions appear and the reading voice starts. Then:
+   switch the watching language to Japanese and confirm the captions redraw
+   in it, switch to the townhall script and confirm the roster groups by
+   language rather than by person, and open `/demo?play=0` to check the
+   finished call renders in one paint with nothing still spinning.
 3. Create a real room from the lobby, pick Bahasa Indonesia as what you speak
    and English as what you hear (swap on the second device).
 4. Speak three sentences containing a protocol noun ("validator", "seed
@@ -47,6 +51,9 @@ Run every row. `n/a` in a cell is a result, not a skip.
 7. Switch listening mode through all three values (translation, original,
    both). Confirm the audio follows.
 8. Leave the call, then submit `/feedback` from the ended screen.
+9. Back on `/demo`, press **Try it with your own voice** and confirm it opens
+   a practice call of your own. Pressing it a second time must return to the
+   same room rather than making another one.
 
 ## What each compat probe means for this checklist
 
