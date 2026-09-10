@@ -98,13 +98,20 @@ usually only affects a signed-out or first-load state.
 
 ## "The interface is in the wrong language"
 
+Open the language sheet and use **Interface language**, the section under
+"What I hear". "Match my device" is the default and means no stored choice.
+
 The app resolves interface language in this order: the preference saved in
-your profile, then your platform language setting, then the device language,
-then English. A platform setting of "no preference" means no preference, not
-English, so the device gets a say.
+your profile (that picker), then your platform language setting, then the
+device language, then English. A platform setting of "no preference" means no
+preference, not English, so the device gets a say.
+
+The interface language is separate from the language you hear. Changing it
+does not change which language captions are translated into; the sentence
+under the listening modes names that one.
 
 Add `?lang=id` or `?lang=en` to any URL to force it for that view. That is
-display-only and writes nothing.
+display-only and writes nothing, so it never disagrees with what is saved.
 
 ## "I cannot see the admin screens"
 
