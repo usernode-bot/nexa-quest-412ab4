@@ -198,6 +198,31 @@
       "name": "Demo language sheet opens from a deep link",
       "path": "/demo?play=0&screen=languages",
       "expectSelector": "#lang-sheet"
+    },
+    {
+      "name": "Listening modes read in English",
+      "path": "/room/DEMOSUP?screen=languages&lang=en",
+      "expectText": "What you hear"
+    },
+    {
+      "name": "Listening modes read in Indonesian",
+      "path": "/room/DEMOSUP?screen=languages&lang=id",
+      "expectText": "Yang Anda dengar"
+    },
+    {
+      "name": "In-room listening selector follows the interface language",
+      "path": "/room/DEMOSUP?lang=id",
+      "expectSelector": "#audio-mode [data-audio-mode=\"both\"]"
+    },
+    {
+      "name": "The listening section names the language you hear",
+      "path": "/room/DEMOSUP?lang=en",
+      "expectText": "Translated captions and voice are in"
+    },
+    {
+      "name": "Language sheet carries an interface-language picker",
+      "path": "/?screen=languages",
+      "expectSelector": "#ui-lang-picker"
     }
   ]
 }
