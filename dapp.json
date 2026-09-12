@@ -136,7 +136,7 @@
     },
     {
       "name": "Demo call plays a translated caption",
-      "path": "/demo",
+      "path": "/demo?play=0",
       "expectSelector": "#feed .utterance .translation"
     },
     {
@@ -163,6 +163,41 @@
       "name": "Error console groups client and server errors",
       "path": "/admin/errors",
       "expectSelector": "#error-list"
+    },
+    {
+      "name": "Demo runs inside the real call chrome",
+      "path": "/demo?play=0",
+      "expectSelector": "#speaker-slots"
+    },
+    {
+      "name": "Demo roster groups people by language",
+      "path": "/demo?play=0",
+      "expectSelector": "#roster .lang-group"
+    },
+    {
+      "name": "Demo can be watched in Japanese",
+      "path": "/demo?play=0&hears=ja",
+      "expectText": "seed phrase はどこに保管すればいいですか"
+    },
+    {
+      "name": "Demo townhall is a large room",
+      "path": "/demo?script=townhall&play=0",
+      "expectText": "Large room"
+    },
+    {
+      "name": "Demo can hold a caption mid-translation",
+      "path": "/demo?play=0&state=partial",
+      "expectSelector": "#feed .utterance .translation.partial"
+    },
+    {
+      "name": "Demo offers a practice call",
+      "path": "/demo?play=0",
+      "expectSelector": "#demo-try"
+    },
+    {
+      "name": "Demo language sheet opens from a deep link",
+      "path": "/demo?play=0&screen=languages",
+      "expectSelector": "#lang-sheet"
     },
     {
       "name": "Listening modes read in English",

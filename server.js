@@ -475,7 +475,7 @@ app.get('/api/config', (req, res) => {
     uiLangs: UI_LANGS,
     defaultUiLang: DEFAULT_UI_LANG,
     slo: { targets: SLO.TARGETS, rates: SLO.RATES, minSamples: SLO.MIN_SAMPLES },
-    demo: CONFIG.DEMO_SCRIPT,
+    demo: CONFIG.DEMO_SCRIPTS,
     version: APP_VERSION,
   });
 });
