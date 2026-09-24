@@ -52,6 +52,40 @@ pool.on('error', (err) => {
   log.error('pool', { msg: err && err.message });
 });
 
+// The dashboard's percentile aggregates and the alert evaluator are read-only,
+// but they are also the app's heaviest queries: they scan by TIME WINDOW over
+// tables that grow with how much the app has been used, not with how many
+// people are in a call. On the shared pool they competed directly with the
+// caption path — a metrics load could hold every interactive connection, and a
+// five-second statement_timeout tuned for "a listener is waiting on this
+// response" killed a legitimate week-wide aggregation outright, turning
+// /admin/metrics into a 500. So they get their own small pool with a deadline
+// of their own.
+//
+// Two deliberate choices. The pool is small and separate, so a slow dashboard
+// draws from its own few connections and cannot starve a call no matter how
+// many people open it at once. The longer timeout is honest about what this
+// work is: nobody is holding a conversation while it runs, so being slow is
+// acceptable in a way it never is on the caption path — being killed halfway
+// is not.
+const ANALYTICS_STATEMENT_TIMEOUT_MS = 20000;
+// A single dashboard view fans out ten reads at once, so with only four
+// connections the later ones necessarily queue behind the earlier ones. That
+// is the intended shape (the analytics pool is small on purpose), which means
+// the acquisition deadline has to be generous or a queued read would fail for
+// the crime of waiting its turn.
+const ANALYTICS_ACQUIRE_TIMEOUT_MS = 30000;
+const analyticsPool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 8,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: ANALYTICS_ACQUIRE_TIMEOUT_MS,
+  statement_timeout: ANALYTICS_STATEMENT_TIMEOUT_MS,
+});
+analyticsPool.on('error', (err) => {
+  log.error('analytics_pool', { msg: err && err.message });
+});
+
 // Stamped into /health and every boot line so a log can be tied to a build.
 const APP_VERSION = process.env.USERNODE_BUILD_SHA
   || process.env.GIT_COMMIT
@@ -1733,7 +1767,7 @@ app.get('/api/errors', async (req, res) => {
 app.get('/api/alerts', async (req, res) => {
   try {
     res.json({
-      alerts: await alerts.list(pool, req.query.limit),
+      alerts: await alerts.list(analyticsPool, req.query.limit),
       rules: SLO.RULES,
       evalIntervalMs: SLO.EVAL_INTERVAL_MS,
     });
@@ -1827,7 +1861,7 @@ app.get('/api/metrics', async (req, res) => {
     const admin = isAdmin(req.user);
     const [latency, rollups, grants, live, byTier, spend, degraded, endToEnd, failures, openAlerts]
       = await Promise.all([
-      pool.query(
+      analyticsPool.query(
         `SELECT
            COUNT(*)::int AS n,
            ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY latency_ms))::int AS p50,
@@ -1840,12 +1874,12 @@ app.get('/api/metrics', async (req, res) => {
          FROM utterance_translations
          WHERE created_at > ${window}`
       ),
-      pool.query('SELECT * FROM daily_usage ORDER BY day DESC LIMIT 14'),
-      pool.query(
+      analyticsPool.query('SELECT * FROM daily_usage ORDER BY day DESC LIMIT 14'),
+      analyticsPool.query(
         `SELECT outcome, COUNT(*)::int AS n FROM llm_grant_events
          WHERE created_at > NOW() - INTERVAL '30 days' GROUP BY outcome`
       ),
-      pool.query(
+      analyticsPool.query(
         `SELECT COUNT(*)::int AS open_rooms,
                 (SELECT COUNT(*)::int FROM room_participants
                  WHERE left_at IS NULL AND removed = FALSE) AS live_participants
@@ -1854,7 +1888,7 @@ app.get('/api/metrics', async (req, res) => {
       // Latency is not one number: a townhall fanning out to four languages
       // and a two-person support call are different workloads, and averaging
       // them together hides whichever one is sick.
-      pool.query(
+      analyticsPool.query(
         `SELECT r.scale_tier AS tier,
                 COUNT(t.*)::int AS n,
                 ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY t.latency_ms))::int AS p50,
@@ -1867,7 +1901,7 @@ app.get('/api/metrics', async (req, res) => {
       ),
       // Cost per call, read off the proxy's own meter rather than a token
       // price table this app would only get wrong.
-      pool.query(
+      analyticsPool.query(
         `SELECT COALESCE(SUM(spent_cents), 0)::float AS spent_cents,
                 COALESCE(SUM(translation_calls), 0)::int AS calls,
                 COALESCE(SUM(utterances), 0)::int AS utterances,
@@ -1875,7 +1909,7 @@ app.get('/api/metrics', async (req, res) => {
            FROM room_sessions
           WHERE started_at > ${window}`
       ),
-      pool.query(
+      analyticsPool.query(
         `SELECT degraded_to, COUNT(*)::int AS n
            FROM room_sessions
           WHERE started_at > ${window} AND degraded_to IS NOT NULL
@@ -1883,16 +1917,16 @@ app.get('/api/metrics', async (req, res) => {
       ),
       // The three legs of the wait, measured separately. `latency` above is
       // the middle one only.
-      latencyLog.endToEnd(pool, range),
+      latencyLog.endToEnd(analyticsPool, range),
       // Why captions failed. Without this every proxy problem, every declined
       // grant and every network blip looked like the same grey bar.
-      pool.query(
+      analyticsPool.query(
         `SELECT COALESCE(fail_code, 'unknown') AS code, status, COUNT(*)::int AS n
            FROM utterance_translations
           WHERE created_at > ${window} AND status IN ('error', 'unavailable')
           GROUP BY 1, 2 ORDER BY COUNT(*) DESC LIMIT 12`
       ),
-      alerts.list(pool, 12),
+      alerts.list(analyticsPool, 12),
     ]);
     const grantMap = Object.fromEntries(grants.rows.map((r) => [r.outcome, r.n]));
     const asked = (grantMap.granted || 0) + (grantMap.declined || 0) + (grantMap.dismissed || 0);
@@ -2027,7 +2061,7 @@ async function houseKeepingHourly() {
     await pool.query(`DELETE FROM rate_events WHERE created_at < NOW() - INTERVAL '2 hours'`);
     // Latency samples are aggregates, not content, but they are also not
     // interesting past the window the metrics screen reads.
-    await latencyLog.prune(pool);
+    await latencyLog.prune(analyticsPool);
     // Error events are diagnostics with a short shelf life. Two weeks is long
     // enough to cover a pilot week and the retrospective after it.
     await pool.query(`DELETE FROM error_events WHERE created_at < NOW() - INTERVAL '14 days'`);
@@ -2098,7 +2132,7 @@ async function houseKeepingHourly() {
 async function evaluateAlerts() {
   if (shuttingDown) return;
   try {
-    await alerts.evaluate(pool, { latency: latencyLog, slo: SLO });
+    await alerts.evaluate(analyticsPool, { latency: latencyLog, slo: SLO });
   } catch (err) {
     log.error('alerts', { msg: err && err.message });
   }
@@ -2149,6 +2183,11 @@ async function shutdown(signal) {
     await pool.end();
   } catch (e) {
     log.error('shutdown', { detail: 'pool.end failed', msg: e.message });
+  }
+  try {
+    await analyticsPool.end();
+  } catch (e) {
+    log.error('shutdown', { detail: 'analyticsPool.end failed', msg: e.message });
   }
   process.exit(0);
 }
