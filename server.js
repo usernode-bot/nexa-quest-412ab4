@@ -21,6 +21,11 @@ const SLO = require('./lib/slo');
 const { t, STRINGS, UI_LANGS, DEFAULT_UI_LANG, resolveUiLang } = require('./lib/strings');
 const alerts = require('./lib/alerts');
 
+// The platform's address, injected by the platform at deploy (#2047). Never
+// written out here: a hardcoded hostname is what broke this app when the
+// platform moved domains. Empty only outside the platform (local runs).
+const PLATFORM_ORIGIN = (process.env.USERNODE_PLATFORM_ORIGIN || '').replace(/\/+$/, '');
+
 const {
   LANG_CODES, LANG_BY_CODE, PURPOSE_KEYS, LIMITS,
   TIER_BY_KEY, TIER_KEYS, PURPOSE_TIER,
@@ -55,7 +60,7 @@ const APP_VERSION = process.env.USERNODE_BUILD_SHA
 const STARTED_AT = Date.now();
 
 const IS_STAGING = process.env.USERNODE_ENV === 'staging';
-const PLATFORM_BASE_URL = 'https://social-vibecoding.usernodelabs.org';
+const PLATFORM_BASE_URL = PLATFORM_ORIGIN;
 const APP_SLUG = 'live-translation';
 
 // --- auth ------------------------------------------------------------------
