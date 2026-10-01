@@ -151,7 +151,8 @@
     {
       "name": "Device check reports the microphone ask",
       "path": "/admin/compat",
-      "expectSelector": "#compat-mic"
+      "expectSelector": "#compat-mic",
+      "expectText": "allowed per app through the platform dialog"
     },
     {
       "name": "Pilot feedback form opens from a room",
