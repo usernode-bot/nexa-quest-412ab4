@@ -11,13 +11,18 @@ row.
 - **No speech recognition.** Firefox has none at all, and some WebViews do
   not expose it. The typed composer is the answer and the app should already
   be showing it as the primary input.
-- **Microphone unreachable in the frame.** The row says so distinctly, and it
-  is not the user's permission setting. The platform does not delegate
-  microphone to app frames; an undelegated capability rejects with the same
-  code a refusal produces. Do not send anyone to their device settings. Typed
-  input is the supported path inside the Usernode app.
-- **Microphone denied by the user.** Then it is a device setting, and the
-  compat row will say denied rather than unreachable.
+- **Microphone not allowed yet.** The normal path: the app asks through the
+  platform dialog on the "Allow microphone" card, and the dialog names this
+  app. If the card is the warning one instead, the person said no at some
+  point; "Try again" asks once more, and the answer can also be changed in
+  the app permissions in the Usernode settings. Do not send anyone to
+  browser site settings; the grant belongs to the platform, not to the page.
+- **Microphone not available in this view.** The row says so distinctly, and
+  it is not the user's doing: the app frame was never handed the
+  capability (a preview build, a signed-out page). Nothing to change in the
+  browser; typed input still works.
+- **No microphone on the device.** A distinct line on the card; typed input
+  is the path.
 
 ## "I am talking but nothing appears"
 

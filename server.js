@@ -1746,7 +1746,7 @@ app.get('/api/alerts', async (req, res) => {
 // caption text: a device report is a description of the browser, not of the
 // conversation that happened in it.
 const COMPAT_KEYS = new Set([
-  'speech', 'mic', 'micPolicy', 'tts', 'voices', 'audioContext',
+  'speech', 'mic', 'micPolicy', 'micState', 'tts', 'voices', 'audioContext',
   'storage', 'longPoll', 'safeArea', 'platform', 'tier',
 ]);
 

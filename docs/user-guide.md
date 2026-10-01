@@ -82,9 +82,8 @@ to use the app, not a fallback for failure. Use it when:
 
 - You are somewhere you cannot talk.
 - Your browser has no speech recognition. Firefox has none at all.
-- You are inside the Usernode mobile app, where the microphone is currently
-  not available to apps. The composer will be the primary input there and the
-  app will say so.
+- You said no to the microphone, or the device has none. The room tells you
+  which, and typing is still right there.
 
 Typed captions translate exactly like spoken ones.
 
