@@ -647,6 +647,112 @@
     });
   }
 
+  // --- microphone permission -------------------------------------------------
+  // Inside the platform frame the microphone is a gated capability: the app
+  // must declare it in dapp.json, and the platform only shows its dialog when
+  // the app asks on a deliberate tap. Raw getUserMedia never raises one. So
+  // the ask lives in this one state machine, and every path into the
+  // microphone (the card's button, the mic button, the recogniser's own
+  // not-allowed error) funnels through it.
+  const MIC_INTENT_KEY = 'lt.mic.wanted';
+
+  const MicAccess = {
+    // undetermined | granted | declined | not_available | no_device | reloading
+    state: 'undetermined',
+    resolved: false,
+
+    async resolve() {
+      if (this.resolved) return this.state;
+      const un = window.usernode;
+      if (un && typeof un.getPermission === 'function') {
+        try {
+          const r = await un.getPermission('microphone');
+          if (r && r.state === 'granted') this.state = 'granted';
+          else if (r && r.state === 'denied' && r.reason === 'declined') this.state = 'declined';
+          // Any other denial leaves the state open: the card keeps offering
+          // the ask, and a real tap resolves the true answer.
+        } catch { /* no shell — fall through to the document probes */ }
+      }
+      if (this.state === 'undetermined' && !un) {
+        // Standalone browser (not inside the platform shell): the frame's own
+        // permission policy is the only signal available.
+        let delegated = null;
+        try {
+          const policy = document.permissionsPolicy || document.featurePolicy;
+          if (policy && typeof policy.allowsFeature === 'function') {
+            delegated = policy.allowsFeature('microphone');
+          }
+        } catch { delegated = null; }
+        if (delegated === false) this.state = 'not_available';
+      }
+      this.resolved = this.state !== 'undetermined';
+      return this.state;
+    },
+
+    async request(wantListening) {
+      if (wantListening) {
+        // Remember the tap before anything async runs: the first-ever grant
+        // reloads the frame, and the reopen should come back listening.
+        try { sessionStorage.setItem(MIC_INTENT_KEY, '1'); } catch { /* ignore */ }
+      }
+      const un = window.usernode;
+      if (un && typeof un.requestPermission === 'function') {
+        try {
+          const r = await un.requestPermission('microphone');
+          if (r && r.state === 'granted') {
+            if (r.active === false) {
+              // Granted, but the frame's policy was computed before the grant
+              // and the platform is about to reload. Touch nothing else here;
+              // in particular do not call getUserMedia yet.
+              this.state = 'reloading';
+              this.resolved = true;
+              return this.state;
+            }
+            await this.verify(wantListening);
+          } else if (r && r.state === 'denied') {
+            this.state = r.reason === 'declined' ? 'declined' : 'not_available';
+          }
+        } catch { /* no shell — the raw prompt below is the ask */ }
+      }
+      if (this.state === 'undetermined') {
+        // Standalone browser, or the bridge could not answer: the browser's
+        // own prompt appears exactly once, on this tap.
+        await this.verify(wantListening);
+      }
+      if (this.state !== 'reloading') {
+        try { sessionStorage.removeItem(MIC_INTENT_KEY); } catch { /* ignore */ }
+      }
+      this.resolved = true;
+      return this.state;
+    },
+
+    // Settle the machine against the real thing: acquire the microphone
+    // stream, and read the rejection if there is one.
+    async verify(wantListening) {
+      try {
+        await Speech.ensureStream();
+        this.state = 'granted';
+        // The card path only proves the permission; release the stream again
+        // so the mic is not held open until the person actually speaks.
+        if (!wantListening) Speech.stopLevelMeter();
+      } catch (err) {
+        this.state = this.classify(err);
+      }
+    },
+
+    classify(err) {
+      const name = (err && (err.name || err.message)) || '';
+      if (/NotFound|Overconstrained|DevicesNotFound|NotReadable/.test(name)) return 'no_device';
+      if (/NotSupported/.test(name)) return 'not_available';
+      return 'declined';
+    },
+
+    noteDenied() {
+      this.state = 'declined';
+      this.resolved = true;
+    },
+  };
+
   // --- speech: recognition (in) and synthesis (out) -------------------------
   const Speech = {
     rec: null,
@@ -672,6 +778,18 @@
       this.onFinal = onFinal;
       this.langCode = langCode;
 
+      // The stream comes first. A rejection here is a classifiable permission
+      // answer before the recogniser exists, so the recogniser is never
+      // created unless the microphone is actually ours.
+      try {
+        await this.ensureStream();
+      } catch (err) {
+        this.wantListening = false;
+        MicAccess.state = MicAccess.classify(err);
+        MicAccess.resolved = true;
+        throw err;
+      }
+
       const rec = new Ctor();
       rec.lang = langOf(langCode).stt;
       rec.continuous = true;
@@ -696,7 +814,8 @@
       rec.onerror = (ev) => {
         if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
           this.wantListening = false;
-          setMicError('Microphone blocked. Allow it in your browser, or type instead.');
+          MicAccess.noteDenied();
+          setMicError(t('mic.stopped'));
         } else if (ev.error === 'no-speech' || ev.error === 'aborted') {
           /* normal in a quiet room */
         } else {
@@ -713,7 +832,7 @@
 
       this.rec = rec;
       try { rec.start(); } catch { /* already started */ }
-      await this.startLevelMeter();
+      this.wireLevelMeter();
     },
 
     stop() {
@@ -745,15 +864,24 @@
       }
     },
 
-    async startLevelMeter() {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
-      try {
-        this.stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        });
-      } catch {
-        return; // the recogniser may still work; the meter is a nicety
+    // One microphone stream, acquired once and shared by the recogniser's
+    // warm-up and the level meter. Never two live streams: echo suppression
+    // depends on this being the only listener in the room.
+    async ensureStream() {
+      if (this.stream && this.stream.active) return this.stream;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        const e = new Error('NotSupportedError');
+        e.name = 'NotSupportedError';
+        throw e;
       }
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      return this.stream;
+    },
+
+    wireLevelMeter() {
+      if (!this.stream) return;
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return;
       this.audioCtx = new Ctx();
@@ -1300,6 +1428,64 @@
     }</p>`;
   }
 
+  // One card per microphone state, rendered above the mic button. The
+  // granted state renders nothing: the room then looks exactly as it did
+  // before. Style follows the room's existing notice cards, amber warning
+  // only for the state the person caused by saying no.
+  function micPermissionHTML() {
+    if (!S.isMember || S.demo.active) return '';
+    if (MicAccess.state === 'granted') return '';
+    if (MicAccess.state === 'declined') {
+      return `<div id="mic-permission" class="p-3 rounded-xl bg-amber-500/10 ring-1 ring-amber-500/30 space-y-2">
+        <p class="text-sm text-amber-300">${esc(t('mic.declinedTitle'))}</p>
+        <p class="text-xs text-amber-400/80">${esc(t('mic.declinedBody'))}</p>
+        <button id="mic-allow" class="un-pressable w-full py-2.5 rounded-lg bg-amber-500/20 text-amber-200 text-sm font-medium">${esc(t('common.retry'))}</button>
+      </div>`;
+    }
+    if (MicAccess.state === 'reloading') {
+      return `<div id="mic-permission" class="p-3 rounded-xl bg-zinc-900 space-y-2">
+        <p class="text-sm text-zinc-300">${esc(t('mic.reopening'))}</p>
+      </div>`;
+    }
+    if (MicAccess.state === 'not_available') {
+      return `<div id="mic-permission" class="p-3 rounded-xl bg-zinc-900 space-y-2">
+        <p class="text-sm text-zinc-300">${esc(t('mic.notAvailableTitle'))}</p>
+        <p class="text-xs text-zinc-500">${esc(t('mic.notAvailableBody'))}</p>
+      </div>`;
+    }
+    if (MicAccess.state === 'no_device') {
+      return `<div id="mic-permission" class="p-3 rounded-xl bg-zinc-900 space-y-2">
+        <p class="text-xs text-zinc-400">${esc(t('mic.noDevice'))}</p>
+      </div>`;
+    }
+    // Undetermined: the ask itself, on the one deliberate tap.
+    return `<div id="mic-permission" class="p-3 rounded-xl bg-zinc-900 space-y-2">
+      <p class="text-sm font-medium text-zinc-200">${esc(t('mic.cardTitle'))}</p>
+      <p class="text-xs text-zinc-500">${esc(t('mic.cardBody'))}</p>
+      <button id="mic-allow" class="un-pressable w-full py-2.5 rounded-lg bg-violet-600 text-white text-sm font-medium">${esc(t('mic.allow'))}</button>
+    </div>`;
+  }
+
+  // Resolve the permission state once per page load, then redraw if the
+  // resolution changed it. Re-render only on change: renderRoom calls this at
+  // its tail, so an unconditional redraw would loop with every poll tick.
+  async function refreshMicState() {
+    const before = MicAccess.state;
+    try { await MicAccess.resolve(); } catch { /* stays as it was */ }
+    if (MicAccess.state === before) return;
+    renderRoom();
+  }
+
+  // The one path that turns the microphone on: recognition (which acquires
+  // the stream first), then the server learns the mic is on. Best effort on
+  // the PATCH: listening is real even if the roster update fails.
+  async function startListening(code) {
+    await Speech.start(S.prefs.speaksLang, onFinalTranscript);
+    try {
+      await api(`/api/rooms/${code}/me`, { method: 'PATCH', body: { micOn: true } });
+    } catch { /* best effort */ }
+  }
+
   function composerHTML() {
     if (!S.isMember) {
       return `
@@ -1376,6 +1562,7 @@
       <div class="space-y-2">
         ${soloNoteHTML()}
         ${queueLine}
+        ${micPermissionHTML()}
         <p id="mic-error" class="hidden text-xs text-amber-400"></p>
         <p id="interim" class="hidden text-sm text-zinc-500 italic px-1"></p>
         <div class="h-1 rounded-full bg-zinc-800 overflow-hidden">
@@ -1517,6 +1704,24 @@
     else bindRoomEvents();
     const feed = document.getElementById('feed');
     if (feed && atBottom) feed.scrollTop = feed.scrollHeight;
+
+    refreshMicState();
+
+    // Auto-resume across the platform reload. The first-ever grant reloads
+    // the frame; the tap that triggered it was remembered, so the reopen
+    // starts listening again without a second press. Floor claims are server
+    // state, so only a plain "was about to speak" intent resumes here.
+    if (!S.demo.active && S.isMember && Speech.supported()
+        && MicAccess.state === 'granted' && !Speech.wantListening) {
+      let wanted = false;
+      try { wanted = sessionStorage.getItem(MIC_INTENT_KEY) === '1'; } catch { wanted = false; }
+      if (wanted) {
+        try { sessionStorage.removeItem(MIC_INTENT_KEY); } catch { /* ignore */ }
+        startListening(S.route.code)
+          .then(() => { if (Speech.wantListening) renderRoom(); })
+          .catch(() => { /* the card already explains the failure */ });
+      }
+    }
   }
 
   function bindRoomEvents() {
@@ -1570,19 +1775,34 @@
       });
     }
 
+    if (el('mic-allow')) {
+      el('mic-allow').addEventListener('click', async (e) => {
+        e.target.disabled = true;
+        await MicAccess.request(false);
+        renderRoom();
+      });
+    }
+
     if (el('mic-toggle')) {
       el('mic-toggle').addEventListener('click', async () => {
         if (Speech.wantListening) {
           Speech.stop();
+          try { sessionStorage.removeItem(MIC_INTENT_KEY); } catch { /* ignore */ }
           await releaseFloor();
           try { await api(`/api/rooms/${code}/me`, { method: 'PATCH', body: { micOn: false } }); } catch { /* best effort */ }
           renderRoom();
           return;
         }
         try {
-          await Speech.start(S.prefs.speaksLang, onFinalTranscript);
-          await api(`/api/rooms/${code}/me`, { method: 'PATCH', body: { micOn: true } });
+          if (MicAccess.state !== 'granted') {
+            const st = await MicAccess.request(true);
+            if (st !== 'granted') { renderRoom(); return; }
+          }
+          await startListening(code);
+          try { sessionStorage.removeItem(MIC_INTENT_KEY); } catch { /* ignore */ }
         } catch (err) {
+          MicAccess.state = MicAccess.classify(err);
+          MicAccess.resolved = true;
           setMicError(err.message);
         }
         renderRoom();
@@ -2448,13 +2668,12 @@
       out.storage = true;
     } catch { out.storage = false; }
 
-    // The microphone is the important one. The platform delegates only
-    // geolocation, clipboard-write and pointer-lock to app frames, and an
-    // undelegated capability rejects with the SAME PERMISSION_DENIED a person
-    // tapping Block produces. So ask the frame's own policy first: "the page
-    // that embeds us never handed this down" is a different answer from "you
-    // said no", and telling someone to check a permission they were never
-    // asked for is the failure this screen exists to prevent.
+    // The microphone is the important one. It is granted per app through the
+    // platform's own dialog, which the app raises on a deliberate tap; a
+    // frame that was never granted it fails with the SAME PERMISSION_DENIED
+    // code a person tapping Block produces. So the state machine, not the
+    // raw policy, is what this row reports: "not allowed yet", "you said
+    // no" and "the frame was never given it" are different answers.
     let delegated = null;
     try {
       const policy = document.permissionsPolicy || document.featurePolicy;
@@ -2462,15 +2681,16 @@
         delegated = policy.allowsFeature('microphone');
       }
     } catch { delegated = null; }
-    let micState = null;
+    let micPermission = null;
     try {
       if (navigator.permissions && navigator.permissions.query) {
         const st = await navigator.permissions.query({ name: 'microphone' });
-        micState = st && st.state;
+        micPermission = st && st.state;
       }
-    } catch { micState = null; }
+    } catch { micPermission = null; }
     out.micPolicy = delegated === false ? 'blocked' : (delegated === true ? 'delegated' : 'unknown');
-    out.mic = delegated === false ? false : (micState === 'granted' ? true : (micState === 'denied' ? false : null));
+    out.mic = delegated === false ? false : (micPermission === 'granted' ? true : (micPermission === 'denied' ? false : null));
+    out.micState = await MicAccess.resolve();
 
     // Voices are counted per launch language, because "speech synthesis
     // works" and "this device can say Bahasa Indonesia" are different facts.
@@ -2493,7 +2713,7 @@
     out.longPoll = S.lastHoldMs > 0 ? Math.round(S.lastHoldMs) : 0;
     out.platform = (window.unNative && window.unNative.platform) || 'unknown';
     out.tier = (S.tier && S.tier.key) || 'none';
-    return { flags: out, voices, delegated, micState };
+    return { flags: out, voices, delegated, micPermission };
   }
 
   async function renderCompat() {
@@ -2502,22 +2722,29 @@
     const probe = await probeCompat();
     S.compat = probe.flags;
     const f = probe.flags;
-    const badge = (state) => {
+    const badge = (state, labelOverride) => {
       const cls = state === 'yes' ? 'pass' : state === 'no' ? 'crit' : state === 'blocked' ? 'warn' : 'insufficient';
-      const label = state === 'yes' ? t('compat.yes')
+      const label = labelOverride || (state === 'yes' ? t('compat.yes')
         : state === 'no' ? t('compat.no')
-          : state === 'blocked' ? t('compat.micBlocked') : t('compat.unknown');
+          : t('compat.unknown'));
       return `<span class="px-2 py-0.5 rounded-full text-[11px] shrink-0 ${verdictClass(cls)}">${esc(label)}</span>`;
     };
-    const rowFor = (label, state, note) => `
-      <div class="px-3 py-2.5 rounded-lg bg-zinc-900 space-y-1">
+    const rowFor = (label, state, note, id, stateLabel) => `
+      <div ${id ? `id="${esc(id)}"` : ''} class="px-3 py-2.5 rounded-lg bg-zinc-900 space-y-1">
         <div class="flex items-baseline justify-between gap-3">
           <span class="text-sm text-zinc-300">${esc(label)}</span>
-          ${badge(state)}
+          ${badge(state, stateLabel)}
         </div>
         ${note ? `<p class="text-[11px] text-zinc-600">${esc(note)}</p>` : ''}
       </div>`;
-    const micState = f.micPolicy === 'blocked' ? 'blocked' : (f.mic === true ? 'yes' : (f.mic === false ? 'no' : 'unknown'));
+    // The row reports the same machine the room asks through, so the label
+    // matches the card's words exactly.
+    const micToken = f.micState === 'granted' ? 'yes'
+      : f.micState === 'declined' ? 'no'
+        : f.micState === 'not_available' ? 'blocked' : 'unknown';
+    const micLabel = f.micState === 'granted' ? t('compat.micGranted')
+      : f.micState === 'declined' ? t('compat.micOff')
+        : f.micState === 'not_available' ? t('compat.micUnavailable') : t('compat.micNotYet');
     const missingVoices = Object.keys(probe.voices || {})
       .filter((k) => !probe.voices[k])
       .map((k) => langOf(k).label);
@@ -2527,11 +2754,11 @@
       ${header(t('compat.title'), { back: '/' })}
       <main class="max-w-2xl mx-auto px-4 py-5 space-y-4">
         <p class="text-sm text-zinc-400">${esc(t('compat.blurb'))}</p>
-        ${micState !== 'yes' ? `<p class="p-3 rounded-xl bg-amber-500/10 text-amber-300 text-xs">${esc(t('compat.typedFallback'))}</p>` : ''}
+        ${micToken === 'blocked' ? `<p class="p-3 rounded-xl bg-amber-500/10 text-amber-300 text-xs">${esc(t('compat.typedFallback'))}</p>` : ''}
         <section id="compat-table" class="space-y-1.5">
           ${rowFor(t('compat.speech'), f.speech ? 'yes' : 'no',
             f.speech ? '' : 'This browser has no speech recognition. Type instead.')}
-          ${rowFor(t('compat.mic'), micState, t('compat.micNote'))}
+          ${rowFor(t('compat.mic'), micToken, t('compat.micNote'), 'compat-mic', micLabel)}
           ${rowFor(t('compat.tts'), f.tts ? 'yes' : 'no')}
           ${rowFor(t('compat.voices'), f.voices >= langCount ? 'yes' : (f.voices ? 'blocked' : 'no'),
             missingVoices.length ? `${t('common.none')}: ${missingVoices.join(', ')}` : '')}
