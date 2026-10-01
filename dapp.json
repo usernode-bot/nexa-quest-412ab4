@@ -14,6 +14,9 @@
     "purpose": "Translates what people say in a call into each listener's language",
     "suggested_daily_cap_cents": 500
   },
+  "permissions": [
+    { "capability": "microphone", "reason": "Listens to your voice in a call so it can be translated live" }
+  ],
   "tests": [
     {
       "name": "Lobby renders",
@@ -144,6 +147,11 @@
       "name": "Device check reports every probe",
       "path": "/admin/compat",
       "expectSelector": "#compat-table"
+    },
+    {
+      "name": "Device check reports the microphone ask",
+      "path": "/admin/compat",
+      "expectSelector": "#compat-mic"
     },
     {
       "name": "Pilot feedback form opens from a room",
